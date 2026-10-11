@@ -3,19 +3,24 @@ package main
 import (
 	"bytes"
 	"errors"
+	"slices"
 	"testing"
 )
+
+func text(s string) clip {
+	return clip{textKey: []byte(s)}
+}
 
 func TestStaleReadCannotOverwriteNewCopy(t *testing.T) {
 	for _, first := range []side{waylandSide, x11Side} {
 		var s syncState
 		old := s.changed(first)
 		fresh := s.changed(1 - first)
-		if !s.received(1-first, fresh, []byte("fresh")) {
+		if !s.received(1-first, fresh, text("fresh")) {
 			t.Fatal("fresh copy was dropped")
 		}
-		s.copied(first, []byte("fresh"))
-		if s.received(first, old, []byte("old")) {
+		s.copied(first, text("fresh"))
+		if s.received(first, old, text("old")) {
 			t.Fatal("stale transfer would overwrite fresh text")
 		}
 	}
@@ -24,40 +29,119 @@ func TestStaleReadCannotOverwriteNewCopy(t *testing.T) {
 func TestContentEchoAndRepeatedCopy(t *testing.T) {
 	var s syncState
 	generation := s.changed(waylandSide)
-	if !s.received(waylandSide, generation, []byte("A")) {
+	if !s.received(waylandSide, generation, text("A")) {
 		t.Fatal("initial copy was dropped")
 	}
-	s.copied(x11Side, []byte("A"))
+	s.copied(x11Side, text("A"))
 	generation = s.changed(x11Side)
-	if s.received(x11Side, generation, []byte("A")) {
+	if s.received(x11Side, generation, text("A")) {
 		t.Fatal("echo would bounce back")
 	}
 	generation = s.changed(x11Side)
-	if !s.received(x11Side, generation, []byte("B")) {
+	if !s.received(x11Side, generation, text("B")) {
 		t.Fatal("new content was dropped")
 	}
-	s.copied(waylandSide, []byte("B"))
+	s.copied(waylandSide, text("B"))
 	generation = s.changed(waylandSide)
-	if !s.received(waylandSide, generation, []byte("A")) {
+	if !s.received(waylandSide, generation, text("A")) {
 		t.Fatal("copying earlier content again was suppressed")
 	}
 }
 
-func TestOwnershipLossIsNotEmptyText(t *testing.T) {
+func TestEchoComparesEveryFormat(t *testing.T) {
+	var s syncState
+	rich := clip{textKey: []byte("A"), "text/html": []byte("<b>A</b>")}
+	generation := s.changed(waylandSide)
+	if !s.received(waylandSide, generation, rich) {
+		t.Fatal("rich copy was dropped")
+	}
+	s.copied(x11Side, rich)
+	generation = s.changed(x11Side)
+	if !s.received(x11Side, generation, text("A")) {
+		t.Fatal("a copy without the HTML format was treated as an echo")
+	}
+}
+
+func TestOwnerLossDuringOtherSideRead(t *testing.T) {
 	var s syncState
 	generation := s.changed(waylandSide)
-	s.lost(x11Side)
-	if !s.received(waylandSide, generation, []byte("fresh")) {
-		t.Fatal("unrelated owner loss discarded the fresh copy")
+	if _, mirror := s.emptied(x11Side); mirror {
+		t.Fatal("owner loss cleared a copy that was still being read")
 	}
-	s.copied(x11Side, []byte("fresh"))
-	generation = s.changed(waylandSide)
-	s.lost(waylandSide)
-	if s.received(waylandSide, generation, []byte("stale")) {
+	if !s.received(waylandSide, generation, text("fresh")) {
+		t.Fatal("owner loss on the other side discarded the fresh copy")
+	}
+}
+
+func TestOwnerLossKeepsCopyBeingPublished(t *testing.T) {
+	for _, from := range []side{waylandSide, x11Side} {
+		var s syncState
+		generation := s.changed(1 - from)
+		s.received(1-from, generation, text("old"))
+		s.copied(from, text("old"))
+		generation = s.changed(from)
+		if !s.received(from, generation, text("new")) {
+			t.Fatal("new copy was dropped")
+		}
+		// The old owner on the other side exits before the new copy arrives there.
+		if _, mirror := s.emptied(1 - from); mirror {
+			t.Fatal("owner loss cleared the new copy")
+		}
+		if !s.current(generation) {
+			t.Fatal("owner loss cancelled the copy being published")
+		}
+	}
+}
+
+func TestVanishedOwnerCannotCompleteRead(t *testing.T) {
+	var s syncState
+	generation := s.changed(waylandSide)
+	if _, mirror := s.emptied(waylandSide); mirror {
+		t.Fatal("an unread copy was mirrored as a clear")
+	}
+	if s.received(waylandSide, generation, text("stale")) {
 		t.Fatal("a vanished owner completed a stale transfer")
 	}
+}
+
+func TestClearFollowsSyncedClipboard(t *testing.T) {
+	for _, from := range []side{waylandSide, x11Side} {
+		var s syncState
+		generation := s.changed(from)
+		s.received(from, generation, text("secret"))
+		s.copied(1-from, text("secret"))
+		generation, mirror := s.emptied(from)
+		if !mirror || !s.current(generation) {
+			t.Fatal("clearing a synced clipboard did not clear the other side")
+		}
+		s.copied(1-from, nil)
+		if _, mirror := s.emptied(1 - from); mirror {
+			t.Fatal("the mirrored clear bounced back")
+		}
+	}
+}
+
+func TestClearKeepsContentThatWasNotCopied(t *testing.T) {
+	var s syncState
+	generation := s.changed(waylandSide)
+	s.received(waylandSide, generation, text("A"))
+	s.copied(x11Side, text("A"))
+	generation = s.changed(x11Side)
+	s.failed(generation)
+	if _, mirror := s.emptied(waylandSide); mirror {
+		t.Fatal("a clear removed X11 content that was never copied")
+	}
+}
+
+func TestEmptyTextIsNotAnEmptyClipboard(t *testing.T) {
+	var s syncState
+	generation := s.changed(waylandSide)
+	s.received(waylandSide, generation, text("A"))
+	s.copied(x11Side, text("A"))
+	s.emptied(waylandSide)
+	s.copied(x11Side, nil)
 	generation = s.changed(waylandSide)
-	if !s.received(waylandSide, generation, []byte{}) {
+	if !s.received(waylandSide, generation, text("")) {
 		t.Fatal("explicit empty text was suppressed")
 	}
 }
@@ -65,12 +149,31 @@ func TestOwnershipLossIsNotEmptyText(t *testing.T) {
 func TestFailedWriteDoesNotAcknowledgeDestination(t *testing.T) {
 	var s syncState
 	generation := s.changed(waylandSide)
-	if !s.received(waylandSide, generation, []byte("text")) {
+	if !s.received(waylandSide, generation, text("text")) {
 		t.Fatal("initial copy was dropped")
 	}
 	generation = s.changed(waylandSide)
-	if !s.received(waylandSide, generation, []byte("text")) {
+	if !s.received(waylandSide, generation, text("text")) {
 		t.Fatal("failed write was treated as a successful copy")
+	}
+}
+
+func TestWantedFormats(t *testing.T) {
+	offered := map[string]bool{"image/jpeg": true, "image/png": true, "text/plain": true, textKey: true, "text/uri-list": true, "text/html": true, "application/x-other": true}
+	want := []string{textKey, "text/html", "text/uri-list", "image/png"}
+	if got := wanted(offered, textMIMEs); !slices.Equal(got, want) {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if got := wanted(map[string]bool{"application/x-other": true}, textMIMEs); len(got) != 0 {
+		t.Fatalf("unsupported types were selected: %q", got)
+	}
+}
+
+func TestClipFormats(t *testing.T) {
+	c := clip{"image/png": nil, textKey: nil, "text/uri-list": nil, "text/html": nil}
+	want := []string{"text/html", "text/uri-list", "image/png"}
+	if got := c.formats(); !slices.Equal(got, want) {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
@@ -88,6 +191,10 @@ func TestReadText(t *testing.T) {
 	}
 	if data, err := readText(failedReader{}, 1024); err == nil || data != nil {
 		t.Fatal("read failure was converted to clipboard data")
+	}
+	binary := []byte{0x89, 'P', 'N', 'G', 0, 0xff}
+	if got, err := readData(bytes.NewReader(binary), 1024); err != nil || !bytes.Equal(got, binary) {
+		t.Fatalf("binary data changed: error=%v", err)
 	}
 }
 

@@ -36,20 +36,21 @@ func testX11Limits(t *testing.T, logs string) {
 			if test.target == "STRING" {
 				want = bytes.Repeat([]byte("é"), test.size)
 			}
-			stop := serveX11LimitSelection(t, valid, test.target, test.incremental, test.advertiseSize)
+			stopValid := serveX11LimitSelection(t, valid, test.target, test.incremental, test.advertiseSize)
 			d.await(waylandSide, want)
-			stop()
 
 			failures := func() int {
 				output, err := os.ReadFile(logs)
 				if err != nil {
 					t.Fatal(err)
 				}
-				return strings.Count(string(output), "clip-sync: ignored failed X11 text transfer")
+				return strings.Count(string(output), "clip-sync: ignored failed X11 transfer")
 			}
 			before := failures()
 			oversized := bytes.Repeat([]byte{test.fill}, test.size+1)
-			stop = serveX11LimitSelection(t, oversized, test.target, test.incremental, test.advertiseSize)
+			stop := serveX11LimitSelection(t, oversized, test.target, test.incremental, test.advertiseSize)
+			// The oversized owner replaced this one, so closing it does not empty the clipboard.
+			stopValid()
 			// Require rejection before the ten-second transfer timeout can mask a stalled fixture.
 			deadline := time.Now().Add(5 * time.Second)
 			for failures() == before {
@@ -84,14 +85,7 @@ func serveX11LimitSelection(t *testing.T, data []byte, targetName string, increm
 		}
 	})
 	t.Cleanup(stop)
-	atom := func(name string) xproto.Atom {
-		reply, err := xproto.InternAtom(conn, false, uint16(len(name)), name).Reply()
-		if err != nil {
-			t.Fatal(err)
-		}
-		return reply.Atom
-	}
-	clipboard, targets, text, incr := atom("CLIPBOARD"), atom("TARGETS"), atom(targetName), atom("INCR")
+	clipboard, targets, text, incr := x11Atom(t, conn, "CLIPBOARD"), x11Atom(t, conn, "TARGETS"), x11Atom(t, conn, targetName), x11Atom(t, conn, "INCR")
 	window, err := xproto.NewWindowId(conn)
 	if err != nil {
 		t.Fatal(err)

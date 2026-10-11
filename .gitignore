@@ -2,19 +2,9 @@
 .DS_Store
 ._*
 
-# Local instructions and workspace state
-AGENTS.md
-CLAUDE.md
-GEMINI.md
-.pi/
-.agents/
-.claude/
+# Editor settings
 .idea/
 .vscode/
-.sessions/
-.reviews/
-review-notes/
-*.review.md
 
 # Credentials and local settings
 .env

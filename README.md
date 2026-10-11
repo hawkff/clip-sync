@@ -68,6 +68,8 @@ clip-sync copies these formats when an app offers them, and leaves other formats
   clip-sync drops any transfer that takes longer than 10 seconds, and skips a stalled format so the others still sync.
 - Clearing a clipboard clears the other one too, and so does closing the app that owns it.
   clip-sync clears the other side only when it held the same content, so a newer copy there survives.
+- A clipboard manager may restore the previous content after a clear or after the owning app closes.
+  clip-sync treats that as a new copy and syncs it, so both clipboards end up holding it again.
 - If a transfer fails, or an app offers only formats clip-sync doesn't copy, the other clipboard keeps its content.
 - clip-sync ignores clipboard entries it created and skips content the other side already has.
   Copies don't loop, even when a clipboard manager re-copies them.
@@ -82,6 +84,7 @@ It doesn't keep a history or log clipboard contents.
 It syncs copied passwords like any other text.
 Any X11 client and any connected SPICE clipboard endpoint can read them.
 When a password manager clears the clipboard after a timeout, clip-sync clears the other side too.
+A clipboard manager can put the password back, and its history keeps a separate copy that clip-sync doesn't clear.
 
 ## License
 

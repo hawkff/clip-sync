@@ -306,6 +306,7 @@ func TestDesktopBridge(t *testing.T) {
 	d.await(x11Side, fresh)
 
 	t.Run("formats", testFormats)
+	t.Run("oversized format", testOversizedFormat)
 	t.Run("large image", testLargeImage)
 	t.Run("primary", testPrimary)
 	t.Run("clears", testClears)
@@ -391,6 +392,21 @@ func testFormats(t *testing.T) {
 	for _, mime := range []string{"text/html", "x-special/gnome-copied-files", "image/png"} {
 		awaitFormat(t, waylandSide, selClipboard, mime, fromX11[mime])
 	}
+}
+
+func testOversizedFormat(t *testing.T) {
+	html := []byte("<p>valid after oversized text</p>")
+	ownWayland(t, selClipboard, []string{textKey, "text/html"}, func(_ *wayland, mime string, fd int) {
+		// Write in the event loop, one format at a time, like a blocking owner.
+		f := os.NewFile(uintptr(fd), "paste")
+		defer f.Close()
+		if mime == textKey {
+			f.Write(bytes.Repeat([]byte("x"), maxClipboardBytes+1<<20))
+			return
+		}
+		f.Write(html)
+	})
+	awaitFormat(t, x11Side, selClipboard, "text/html", html)
 }
 
 func testLargeImage(t *testing.T) {

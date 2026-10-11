@@ -260,6 +260,8 @@ func (w *wayland) read(sel selection, generation uint64, proxy *control.ExtDataC
 		var formats sync.WaitGroup
 		for i, mime := range mimes {
 			formats.Go(func() {
+				// Closing early lets an owner that writes one format at a time move on.
+				defer pipes[i].Close()
 				key, read := mime, readData
 				if slices.Contains(textMIMEs, mime) {
 					key, read = textKey, readText

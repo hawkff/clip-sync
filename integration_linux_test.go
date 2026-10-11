@@ -156,6 +156,8 @@ func TestDesktopBridge(t *testing.T) {
 		}
 	}
 
+	testX11Limits(t, logs)
+
 	d.copy(x11Side, []byte{'c', 'a', 'f', 0xe9}, "STRING")
 	d.await(waylandSide, []byte("café"))
 	t.Run("paste to file", func(t *testing.T) {

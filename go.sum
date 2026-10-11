@@ -1,0 +1,6 @@
+github.com/AvengeMedia/dankgo v1.6.3-0.20261009142851-1a4f9b2b3ddb h1:5eiJWHFldPZ5SMi+AvAPQmcZ3nYvlgwwVmyH8bAOIhE=
+github.com/AvengeMedia/dankgo v1.6.3-0.20261009142851-1a4f9b2b3ddb/go.mod h1:oNWfG/2In/Znsrq03ZhNP1dCwHmHHm3nOVu6oXgkYIc=
+github.com/jezek/xgb v1.3.1 h1:NQCAEfQyzN+3RjWUSHBuVIxQcy2YfG3/mNvKfs/0rEg=
+github.com/jezek/xgb v1.3.1/go.mod h1:nrhwO0FX/enq75I7Y7G8iN1ubpSGZEiA3v9e9GyRFlk=
+golang.org/x/sys v0.48.0 h1:bbX/i/6MgT9BVLM9RT1thmxL04yeTAhbEz4SyadbXoo=
+golang.org/x/sys v0.48.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=

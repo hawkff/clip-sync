@@ -99,7 +99,8 @@ func paste(from side, sel selection, mime string) ([]byte, error) {
 
 func awaitFormat(t *testing.T, from side, sel selection, mime string, want []byte) {
 	t.Helper()
-	deadline := time.Now().Add(8 * time.Second)
+	// Outlast the bridge's transfer timeout, which can skip a stalled format first.
+	deadline := time.Now().Add(transferTimeout + 2*time.Second)
 	var got []byte
 	var err error
 	for time.Now().Before(deadline) {
@@ -307,6 +308,7 @@ func TestDesktopBridge(t *testing.T) {
 
 	t.Run("formats", testFormats)
 	t.Run("oversized format", testOversizedFormat)
+	t.Run("stalled format", testStalledFormat)
 	t.Run("large image", testLargeImage)
 	t.Run("primary", testPrimary)
 	t.Run("clears", testClears)
@@ -409,6 +411,14 @@ func testOversizedFormat(t *testing.T) {
 	awaitFormat(t, x11Side, selClipboard, "text/html", html)
 }
 
+func testStalledFormat(t *testing.T) {
+	html := []byte("<p>sent although text stalls</p>")
+	ownX11(t, selClipboard, map[string][]byte{"UTF8_STRING": []byte("never sent"), "text/html": html}, func(target string) bool {
+		return target != "UTF8_STRING"
+	})
+	awaitFormat(t, waylandSide, selClipboard, "text/html", html)
+}
+
 func testLargeImage(t *testing.T) {
 	d := &desktop{t: t}
 	image := bytes.Repeat([]byte{0x89, 'P', 'N', 'G', 0, 0xff, '\r', '\n'}, 200000)
@@ -464,8 +474,9 @@ func testClears(t *testing.T) {
 }
 
 // ownX11 owns an X11 selection with the given targets until the test ends.
-// wait, if set, runs before each conversion other than TARGETS.
-func ownX11(t *testing.T, sel selection, formats map[string][]byte, wait func()) {
+// respond, if set, runs before each conversion other than TARGETS and can
+// leave the request unanswered.
+func ownX11(t *testing.T, sel selection, formats map[string][]byte, respond func(target string) bool) {
 	t.Helper()
 	conn, err := xgb.NewConn()
 	if err != nil {
@@ -473,11 +484,11 @@ func ownX11(t *testing.T, sel selection, formats map[string][]byte, wait func())
 	}
 	selectionAtom, targets := x11Atom(t, conn, strings.ToUpper(x11SelectionName(sel))), x11Atom(t, conn, "TARGETS")
 	offered := []xproto.Atom{targets}
-	values := make(map[xproto.Atom][]byte)
+	values, names := make(map[xproto.Atom][]byte), make(map[xproto.Atom]string)
 	for name, value := range formats {
 		atom := x11Atom(t, conn, name)
 		offered = append(offered, atom)
-		values[atom] = value
+		values[atom], names[atom] = value, name
 	}
 	window, err := xproto.NewWindowId(conn)
 	if err != nil {
@@ -512,8 +523,8 @@ func ownX11(t *testing.T, sel selection, formats map[string][]byte, wait func())
 			case !ok:
 				xproto.SendEventChecked(conn, false, e.Requestor, 0, string(notify.Bytes())).Check()
 				continue
-			case wait != nil:
-				wait()
+			case respond != nil && !respond(names[e.Target]):
+				continue
 			}
 			if xproto.ChangePropertyChecked(conn, xproto.PropModeReplace, e.Requestor, e.Property, kind, format, uint32(len(data)/(int(format)/8)), data).Check() == nil {
 				notify.Property = e.Property
@@ -587,7 +598,11 @@ func delayedX11Copy(t *testing.T) (<-chan struct{}, func()) {
 	requested, gate := make(chan struct{}), make(chan struct{})
 	release := sync.OnceFunc(func() { close(gate) })
 	once := sync.OnceFunc(func() { close(requested) })
-	ownX11(t, selClipboard, map[string][]byte{"UTF8_STRING": []byte("stale X11 content")}, func() { once(); <-gate })
+	ownX11(t, selClipboard, map[string][]byte{"UTF8_STRING": []byte("stale X11 content")}, func(string) bool {
+		once()
+		<-gate
+		return true
+	})
 	// Release first: the owner's cleanup waits for a conversion blocked on the gate.
 	t.Cleanup(release)
 	return requested, release

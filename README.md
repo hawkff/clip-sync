@@ -65,7 +65,7 @@ clip-sync copies these formats when an app offers them, and leaves other formats
 ## Behavior
 
 - Each format can be up to 16 MiB, and large X11 transfers use `INCR`.
-  clip-sync drops any transfer that takes longer than 10 seconds.
+  clip-sync drops any transfer that takes longer than 10 seconds, and skips a stalled format so the others still sync.
 - Clearing a clipboard clears the other one too, and so does closing the app that owns it.
   clip-sync clears the other side only when it held the same content, so a newer copy there survives.
 - If a transfer fails, or an app offers only formats clip-sync doesn't copy, the other clipboard keeps its content.

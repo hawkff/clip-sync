@@ -1,99 +1,79 @@
 # clip-sync
 
-A native Go bridge between the Wayland and X11 text clipboards on Linux.
-It connects to both display servers and keeps one connection to each.
-It does not invoke or replace `wl-copy`, `wl-paste`, or `xclip`.
+clip-sync keeps the Wayland and X11 text clipboards in sync on Linux.
+Copy text in a Wayland app and paste it into an X11 app, or the other way around.
 
-A SPICE desktop agent can use the X11 clipboard to exchange text with a remote
-console. `clip-sync` connects that clipboard to native Wayland applications.
-It does not replace the SPICE agent or Xwayland.
+It's a single Go binary with one connection to each display server.
+It doesn't run `wl-copy`, `wl-paste`, or `xclip`.
 
-## Status
+One example is a virtual machine with a SPICE agent.
+The agent shares the X11 clipboard with the remote console, and clip-sync connects that clipboard to your Wayland apps.
+You still need the SPICE agent and an X server such as Xwayland.
 
-Experimental. The headless integration suite uses separate Sway and Xvfb servers.
-The niri, SPICE, and remote-console path still needs end-to-end verification.
+clip-sync is experimental.
 
 ## Requirements
 
-- Linux and one Wayland seat.
-- A compositor with `ext-data-control-v1` or `wlr-data-control-unstable-v1`.
-- An X11 server with XFixes and XC-MISC.
-- Go 1.27 or newer to compile. The compiled binary needs no clipboard helper tools.
+- Linux with a single Wayland seat
+- A compositor that supports `ext-data-control-v1` or `wlr-data-control-unstable-v1`
+- An X11 server with the XFixes and XC-MISC extensions
+- Go 1.27 or newer for `go install`
 
-## Build and run
-
-Run development commands in a Namespace Linux instance:
+## Install
 
 ```sh
-make build
+go install github.com/hawkff/clip-sync@latest
 ```
 
-Run the resulting binary inside the target desktop session:
+Go puts the binary in `$(go env GOPATH)/bin`, or in `$GOBIN` if you set it.
+Prebuilt amd64 and arm64 binaries are on the [releases page](https://github.com/hawkff/clip-sync/releases).
+
+## Usage
+
+Run clip-sync inside your desktop session:
 
 ```sh
-./bin/clip-sync
+clip-sync
 ```
 
-Keep `DISPLAY`, `WAYLAND_DISPLAY`, and `XDG_RUNTIME_DIR` from that session.
-`XAUTHORITY` controls X11 authentication when the session requires it.
-Run only one clipboard bridge for the display pair.
+It needs `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, and `DISPLAY` from that session.
+It also reads `XAUTHORITY` when the X server requires authentication.
+Only one clip-sync can run per Wayland and X11 display pair, and a second one exits with an error.
 
-The process runs in the foreground. Send SIGTERM or press Ctrl-C to stop it.
-It exits on a display disconnect or protocol error. Restart it after the desktop
-recovers. Clipboard data owned by the bridge may disappear when it exits.
+clip-sync runs in the foreground until you press Ctrl-C or send it SIGTERM.
+It exits if either display disconnects or reports a protocol error.
+Restart it after the desktop recovers.
+Text that clip-sync copied to the other side can disappear when it exits.
 
-## Behavior and limits
+## Behavior
 
-- Synchronizes text copied after startup. It leaves existing clipboards alone.
-- Preserves UTF-8, line endings, and empty text. Converts X11 Latin-1 `STRING`
-  selections to UTF-8.
-- Identifies its own X11 window and Wayland offers to avoid feedback loops.
-  Content comparison also suppresses copies echoed by clipboard managers.
-- Discards completed reads after a newer observed clipboard change. X11 claims
-  use server timestamps, and Wayland writes wait for earlier compositor events.
-- Supports large X11 transfers through `INCR`. Clipboard data has a 16 MiB limit.
-  Wayland pipes and X11 `INCR` transfers have 10-second deadlines. Each backend
-  allows up to eight outgoing transfers at once. Regular-file paste destinations
-  do not support write deadlines.
-- Leaves images, file lists, rich text, and the PRIMARY selection unchanged.
+clip-sync syncs text you copy after it starts.
+It leaves both clipboards alone at startup.
 
-Ownership loss, read failures, and unsupported formats do not clear the other
-clipboard. Explicit clipboard clears do not propagate either. The protocols do
-not provide a common clock, so simultaneous copies follow observed event order.
+- UTF-8 text, line endings, and empty text arrive unchanged.
+  Latin-1 `STRING` text from X11 apps becomes UTF-8.
+- Text can be up to 16 MiB, and large X11 transfers use `INCR`.
+  clip-sync drops any transfer that takes longer than 10 seconds.
+- If a transfer fails or the app that owns a clipboard exits, the other clipboard keeps its text.
+- clip-sync ignores clipboard entries it created and skips text the other side already has.
+  Copies don't loop, even when a clipboard manager re-copies them.
+- If you copy again while a slow transfer is running, clip-sync discards the older one.
+  Wayland and X11 share no clock, so if you copy on both sides at once, the copy clip-sync sees last wins.
+
+clip-sync doesn't sync (yet):
+
+- Images, file lists, rich-text formatting, or the middle-click PRIMARY selection.
+- Clipboard clears. If you clear one clipboard, the other keeps its text.
 
 ## Privacy
 
-The bridge holds text in memory. It does not store clipboard history or log
-clipboard contents.
+clip-sync holds clipboard text in memory.
+It doesn't keep a history or log clipboard contents.
 
-Copied passwords also cross the bridge. X11 clients and any connected SPICE
-clipboard endpoint can receive the text. Clearing one clipboard does not erase
-its copy on the other side.
-
-## Development
-
-Run these commands in Namespace, not on the local workstation:
-
-```sh
-make check
-make integration
-```
-
-`make check` checks formatting, runs `go vet`, and runs the unit suite with the
-race detector. It requires a C compiler for the race detector.
-
-`make integration` requires Sway, Xvfb, `wl-clipboard`, and `xclip`. Run it as an
-unprivileged user in a disposable Linux environment. The script creates separate
-display servers, disables Sway's Xwayland bridge, and stops those servers on exit.
-
-To add a six-minute idle descriptor check after the clipboard exercises:
-
-```sh
-CLIP_SYNC_BINARY="$PWD/bin/clip-sync" CLIP_SYNC_SOAK=6m \
-  sh scripts/integration.sh ./bin/integration.test \
-  -test.run TestDesktopBridge -test.v -test.timeout 8m
-```
+It syncs copied passwords like any other text.
+Any X11 client and any connected SPICE clipboard endpoint can read them.
+Clearing one clipboard doesn't clear the other, so a password manager's auto-clear may leave the password on the other side.
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE)

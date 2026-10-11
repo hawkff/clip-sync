@@ -1,0 +1,43 @@
+# macOS metadata
+.DS_Store
+._*
+
+# Local instructions and workspace state
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.pi/
+.agents/
+.claude/
+.idea/
+.vscode/
+.sessions/
+.reviews/
+review-notes/
+*.review.md
+
+# Credentials and local settings
+.env
+.env.*
+!.env.example
+auth.json
+credentials.json
+*.key
+*.pem
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*~
+.cache/
+tmp/
+
+# Go build and coverage output
+/clip-sync
+/bin/
+/build/
+/dist/
+*.test
+*.out
+/coverage/

@@ -146,7 +146,9 @@ func (s *syncState) failed(generation uint64) {
 
 // emptied records that side from lost its owner. It reports whether the other
 // side must be cleared too, and the generation for that clear. The other side
-// is cleared only when it held the same content, so a newer copy there survives.
+// is cleared when it held the same content, or when the latest copy came from
+// this side and may still be on its way there. A newer copy from the other
+// side survives.
 func (s *syncState) emptied(from side) (uint64, bool) {
 	before, other := s.clipboard[from], s.clipboard[1-from]
 	s.clipboard[from] = snapshot{known: true}
@@ -154,7 +156,10 @@ func (s *syncState) emptied(from side) (uint64, bool) {
 		// A newer copy from the other side is still being read.
 		return 0, false
 	}
-	mirror := before.known && !before.opaque && other.known && !other.opaque && before.data.equal(other.data) && len(other.data) > 0
+	read := before.known && !before.opaque
+	synced := read && other.known && !other.opaque && before.data.equal(other.data)
+	otherEmpty := other.known && !other.opaque && len(other.data) == 0
+	mirror := (synced || read && s.origin == from) && !otherEmpty
 	if !mirror && !s.reading {
 		// Keep the generation, so a copy on its way to this side still arrives.
 		return 0, false

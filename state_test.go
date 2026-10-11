@@ -93,6 +93,22 @@ func TestOwnerLossKeepsCopyBeingPublished(t *testing.T) {
 	}
 }
 
+func TestSourceClearCancelsCopyBeingPublished(t *testing.T) {
+	for _, from := range []side{waylandSide, x11Side} {
+		var s syncState
+		generation := s.changed(from)
+		s.received(from, generation, text("old"))
+		s.copied(1-from, text("old"))
+		generation = s.changed(from)
+		s.received(from, generation, text("new"))
+		// The source clears before the new copy reaches the other side.
+		unset, mirror := s.emptied(from)
+		if !mirror || s.current(generation) || !s.current(unset) {
+			t.Fatal("a cleared source still published its copy")
+		}
+	}
+}
+
 func TestVanishedOwnerCannotCompleteRead(t *testing.T) {
 	var s syncState
 	generation := s.changed(waylandSide)

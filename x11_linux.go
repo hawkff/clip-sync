@@ -227,7 +227,7 @@ func (x *x11) handle(event xgb.Event) error {
 		if err != nil {
 			return err
 		}
-		s.read = &xRead{window: window, owner: e.Owner, time: e.Timestamp, generation: generation, clip: clip{}}
+		s.read = &xRead{window: window, owner: e.Owner, time: e.Timestamp, generation: generation, deadline: time.Now().Add(transferTimeout), clip: clip{}}
 		if x.convert(sel, x.atoms["TARGETS"]) != nil {
 			x.readFailed(sel)
 		}
@@ -279,7 +279,6 @@ func (x *x11) handle(event xgb.Event) error {
 func (x *x11) convert(sel selection, target xproto.Atom) error {
 	r := x.sel[sel].read
 	r.target, r.data, r.valueType, r.format, r.incremental = target, nil, 0, 0, false
-	r.deadline = time.Now().Add(transferTimeout)
 	return xproto.ConvertSelectionChecked(x.conn, r.window, x.sel[sel].atom, target, x.atoms["_CLIP_SYNC_DATA"], r.time).Check()
 }
 
@@ -639,7 +638,9 @@ func (x *x11) finishSend(key xKey) {
 func (x *x11) expire(now time.Time) error {
 	for i := range x.sel {
 		if r := x.sel[i].read; r != nil && !now.Before(r.deadline) {
-			if err := x.targetFailed(selection(i)); err != nil {
+			// The transfer ran out of time: keep the formats already read.
+			r.targets = nil
+			if err := x.finishRead(selection(i)); err != nil {
 				return err
 			}
 		}

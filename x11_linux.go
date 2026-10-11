@@ -249,7 +249,8 @@ func (x *x11) readProperty() error {
 		return errors.New("X11 selection exceeds size limit")
 	}
 	if !r.incremental && property.Type == x.atoms["INCR"] {
-		if property.Format != 32 || len(property.Value) != 4 || xgb.Get32(property.Value) > uint32(limit) {
+		// The value is a lower bound on the size. Some owners, such as xclip, omit it.
+		if property.Format != 32 || len(property.Value) > 4 || len(property.Value) == 4 && xgb.Get32(property.Value) > uint32(limit) {
 			return errors.New("invalid INCR size")
 		}
 		r.incremental = true

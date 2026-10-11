@@ -1,7 +1,8 @@
 # clip-sync
 
-clip-sync keeps the Wayland and X11 text clipboards in sync on Linux.
-Copy text in a Wayland app and paste it into an X11 app, or the other way around.
+clip-sync keeps the Wayland and X11 clipboards in sync on Linux.
+Copy in a Wayland app and paste into an X11 app, or the other way around.
+Text, images, rich text, and file lists carry over, and so does the middle-click selection.
 
 It's a single Go binary with one connection to each display server.
 It doesn't run `wl-copy`, `wl-paste`, or `xclip`.
@@ -43,36 +44,44 @@ Only one clip-sync can run per Wayland and X11 display pair, and a second one ex
 clip-sync runs in the foreground until you press Ctrl-C or send it SIGTERM.
 It exits if either display disconnects or reports a protocol error.
 Restart it after the desktop recovers.
-Text that clip-sync copied to the other side can disappear when it exits.
+Content that clip-sync copied to the other side can disappear when it exits.
+
+## What syncs
+
+clip-sync syncs what you copy after it starts.
+It leaves both clipboards alone at startup.
+
+The clipboard and the middle-click PRIMARY selection sync separately.
+PRIMARY needs a compositor with primary selection support.
+
+clip-sync copies these formats when an app offers them, and leaves other formats on their own side:
+
+- Text. UTF-8 text, line endings, and empty text arrive unchanged.
+  Latin-1 `STRING` text from X11 apps becomes UTF-8.
+- Rich text as `text/html` and `text/rtf`.
+- File lists as `text/uri-list`, plus the GNOME and KDE types that mark a copy or a cut.
+- One image, preferring `image/png`, then JPEG, GIF, WebP, and BMP.
 
 ## Behavior
 
-clip-sync syncs text you copy after it starts.
-It leaves both clipboards alone at startup.
-
-- UTF-8 text, line endings, and empty text arrive unchanged.
-  Latin-1 `STRING` text from X11 apps becomes UTF-8.
-- Text can be up to 16 MiB, and large X11 transfers use `INCR`.
-  clip-sync drops any transfer that takes longer than 10 seconds.
-- If a transfer fails or the app that owns a clipboard exits, the other clipboard keeps its text.
-- clip-sync ignores clipboard entries it created and skips text the other side already has.
+- Each format can be up to 16 MiB, and large X11 transfers use `INCR`.
+  clip-sync drops any transfer that takes longer than 10 seconds, and skips a stalled format so the others still sync.
+- Clearing a clipboard clears the other one too, and so does closing the app that owns it.
+  clip-sync clears the other side only when it held the same content, so a newer copy there survives.
+- If a transfer fails, or an app offers only formats clip-sync doesn't copy, the other clipboard keeps its content.
+- clip-sync ignores clipboard entries it created and skips content the other side already has.
   Copies don't loop, even when a clipboard manager re-copies them.
 - If you copy again while a slow transfer is running, clip-sync discards the older one.
   Wayland and X11 share no clock, so if you copy on both sides at once, the copy clip-sync sees last wins.
 
-clip-sync doesn't sync (yet):
-
-- Images, file lists, rich-text formatting, or the middle-click PRIMARY selection.
-- Clipboard clears. If you clear one clipboard, the other keeps its text.
-
 ## Privacy
 
-clip-sync holds clipboard text in memory.
+clip-sync holds clipboard content in memory.
 It doesn't keep a history or log clipboard contents.
 
 It syncs copied passwords like any other text.
 Any X11 client and any connected SPICE clipboard endpoint can read them.
-Clearing one clipboard doesn't clear the other, so a password manager's auto-clear may leave the password on the other side.
+When a password manager clears the clipboard after a timeout, clip-sync clears the other side too.
 
 ## License
 

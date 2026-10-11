@@ -7,14 +7,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/AvengeMedia/dankgo/wayland/client"
 	control "github.com/AvengeMedia/dankgo/wayland/ext_data_control"
 	"golang.org/x/sys/unix"
 )
-
-var textMIMEs = []string{"text/plain;charset=utf-8", "text/plain;charset=UTF-8", "UTF8_STRING", "text/plain"}
 
 type wlEvent struct {
 	sender, opcode uint32
@@ -24,28 +25,35 @@ type wlEvent struct {
 }
 
 type wlOffer struct {
-	proxy *control.ExtDataControlOfferV1
-	mime  string
-	own   string
+	proxy   *control.ExtDataControlOfferV1
+	offered map[string]bool
+	own     string
+}
+
+// wlSelection tracks one Wayland selection: CLIPBOARD or PRIMARY.
+type wlSelection struct {
+	current    *wlOffer
+	source     *control.ExtDataControlSourceV1
+	marker     string
+	pending    *client.Callback
+	readCancel context.CancelFunc
+	// unsets counts our unset requests whose selection events have not arrived.
+	unsets int
 }
 
 type wayland struct {
-	b          *bridge
-	display    *client.Display
-	manager    *control.ExtDataControlManagerV1
-	device     *control.ExtDataControlDeviceV1
-	offers     map[uint32]*wlOffer
-	current    *wlOffer
-	source     *control.ExtDataControlSourceV1
-	pending    *client.Callback
-	read       *os.File
-	readCancel context.CancelFunc
-	marker     string
-	nonce      [16]byte
-	serial     uint64
-	err        error
-	events     chan wlEvent
-	done       chan struct{}
+	b       *bridge
+	display *client.Display
+	manager *control.ExtDataControlManagerV1
+	device  *control.ExtDataControlDeviceV1
+	offers  map[uint32]*wlOffer
+	sel     [2]wlSelection
+	primary bool
+	prefix  string
+	serial  uint64
+	err     error
+	events  chan wlEvent
+	done    chan struct{}
 }
 
 func openWayland(b *bridge) (_ *wayland, err error) {
@@ -63,9 +71,11 @@ func openWayland(b *bridge) (_ *wayland, err error) {
 			display.Context().Close()
 		}
 	}()
-	if _, err = rand.Read(w.nonce[:]); err != nil {
+	var nonce [16]byte
+	if _, err = rand.Read(nonce[:]); err != nil {
 		return nil, err
 	}
+	w.prefix = fmt.Sprintf("application/x-clip-sync-%x-", nonce)
 	ctx := display.Context()
 	if err = ctx.SetReadDeadline(time.Now().Add(transferTimeout)); err != nil {
 		return nil, err
@@ -124,22 +134,22 @@ func openWayland(b *bridge) (_ *wayland, err error) {
 		return nil, err
 	}
 	w.device.SetDataOfferHandler(func(e control.ExtDataControlDeviceV1DataOfferEvent) {
-		offer := &wlOffer{proxy: e.Id}
+		offer := &wlOffer{proxy: e.Id, offered: make(map[string]bool)}
 		w.offers[e.Id.ID()] = offer
 		e.Id.SetOfferHandler(func(e control.ExtDataControlOfferV1OfferEvent) {
-			if e.MimeType == w.marker && w.marker != "" {
+			switch {
+			case strings.HasPrefix(e.MimeType, w.prefix):
 				offer.own = e.MimeType
-			}
-			if mimeRank(e.MimeType) < mimeRank(offer.mime) {
-				offer.mime = e.MimeType
+			case slices.Contains(textMIMEs, e.MimeType), slices.Contains(extraMIMEs, e.MimeType), slices.Contains(imageMIMEs, e.MimeType):
+				offer.offered[e.MimeType] = true
 			}
 		})
 	})
-	w.device.SetSelectionHandler(func(e control.ExtDataControlDeviceV1SelectionEvent) { w.selection(e.Id) })
+	w.device.SetSelectionHandler(func(e control.ExtDataControlDeviceV1SelectionEvent) { w.selection(selClipboard, e.Id) })
+	// Compositors with primary selection support send this event once on bind.
 	w.device.SetPrimarySelectionHandler(func(e control.ExtDataControlDeviceV1PrimarySelectionEvent) {
-		if e.Id != nil {
-			w.destroyOffer(e.Id)
-		}
+		w.primary = true
+		w.selection(selPrimary, e.Id)
 	})
 	w.device.SetFinishedHandler(func(control.ExtDataControlDeviceV1FinishedEvent) {
 		w.fail(errors.New("data-control device finished"))
@@ -159,15 +169,6 @@ func openWayland(b *bridge) (_ *wayland, err error) {
 	return w, nil
 }
 
-func mimeRank(mime string) int {
-	for i, candidate := range textMIMEs {
-		if mime == candidate {
-			return i
-		}
-	}
-	return len(textMIMEs)
-}
-
 func (w *wayland) fail(err error) {
 	if w.err == nil {
 		w.err = err
@@ -181,136 +182,219 @@ func (w *wayland) destroyOffer(offer *control.ExtDataControlOfferV1) {
 	w.display.Context().Unregister(offer)
 }
 
-func (w *wayland) selection(proxy *control.ExtDataControlOfferV1) {
-	w.cancelRead()
-	if w.current != nil {
-		w.destroyOffer(w.current.proxy)
-		w.current = nil
+func (w *wayland) selection(sel selection, proxy *control.ExtDataControlOfferV1) {
+	s := &w.sel[sel]
+	w.cancelRead(sel)
+	if s.current != nil {
+		w.destroyOffer(s.current.proxy)
+		s.current = nil
 	}
 	if proxy != nil {
-		w.current = w.offers[proxy.ID()]
+		s.current = w.offers[proxy.ID()]
+		if s.current == nil {
+			s.current = &wlOffer{proxy: proxy, offered: make(map[string]bool)}
+		}
 	}
 	if !w.b.ready {
 		return
 	}
-	if w.current == nil {
-		w.b.state.lost(waylandSide)
+	if s.current == nil {
+		if s.unsets > 0 {
+			s.unsets--
+			return
+		}
+		w.fail(w.b.emptied(sel, waylandSide))
 		return
 	}
-	if w.source != nil && w.current.own == w.marker && w.marker != "" {
+	if s.source != nil && s.current.own == s.marker {
 		return
 	}
-	generation := w.b.changed(waylandSide)
-	if w.current.mime == "" {
+	generation := w.b.changed(sel, waylandSide)
+	mimes := wanted(s.current.offered, textMIMEs)
+	if len(mimes) == 0 {
+		// Nothing to copy; the other clipboard keeps its content.
+		w.b.state[sel].failed(generation)
 		return
 	}
-	r, writer, err := os.Pipe()
-	if err != nil {
-		w.fail(err)
-		return
+	w.read(sel, generation, s.current.proxy, mimes)
+}
+
+// read receives every wanted format at once, so an owner that writes them in
+// any order cannot stall the transfer.
+func (w *wayland) read(sel selection, generation uint64, proxy *control.ExtDataControlOfferV1, mimes []string) {
+	pipes := make([]*os.File, 0, len(mimes))
+	closePipes := func() {
+		for _, r := range pipes {
+			r.Close()
+		}
 	}
-	if err = r.SetReadDeadline(time.Now().Add(transferTimeout)); err != nil {
-		r.Close()
+	for _, mime := range mimes {
+		r, writer, err := os.Pipe()
+		if err != nil {
+			closePipes()
+			w.fail(err)
+			return
+		}
+		pipes = append(pipes, r)
+		if err = r.SetReadDeadline(time.Now().Add(transferTimeout)); err == nil {
+			err = proxy.Receive(mime, int(writer.Fd()))
+		}
 		writer.Close()
-		w.fail(err)
-		return
-	}
-	err = proxy.Receive(w.current.mime, int(writer.Fd()))
-	writer.Close()
-	if err != nil {
-		r.Close()
-		w.fail(err)
-		return
+		if err != nil {
+			closePipes()
+			w.fail(err)
+			return
+		}
 	}
 	ctx, cancel := context.WithCancel(w.b.ctx)
-	w.read, w.readCancel = r, cancel
+	w.sel[sel].readCancel = cancel
 	w.b.jobs.Add(1)
 	go func() {
 		defer w.b.jobs.Done()
 		defer cancel()
-		defer r.Close()
-		stop := context.AfterFunc(ctx, func() { r.Close() })
+		defer closePipes()
+		stop := context.AfterFunc(ctx, closePipes)
 		defer stop()
-		data, err := readText(r, maxClipboardBytes)
+		data := make(clip)
+		var mu sync.Mutex
+		var formats sync.WaitGroup
+		for i, mime := range mimes {
+			formats.Go(func() {
+				// Closing early lets an owner that writes one format at a time move on.
+				defer pipes[i].Close()
+				key, read := mime, readData
+				if slices.Contains(textMIMEs, mime) {
+					key, read = textKey, readText
+				}
+				value, err := read(pipes[i], maxClipboardBytes)
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				data[key] = value
+				mu.Unlock()
+			})
+		}
+		formats.Wait()
+		var err error
+		if len(data) == 0 {
+			err = errors.New("no clipboard format could be read")
+		}
 		select {
-		case w.b.results <- readResult{generation: generation, data: data, err: err}:
+		case w.b.results <- readResult{sel: sel, generation: generation, data: data, err: err}:
 		case <-ctx.Done():
 		}
 	}()
 }
 
-func (w *wayland) cancelRead() {
-	if w.readCancel != nil {
-		w.readCancel()
-		w.readCancel = nil
-	}
-	if w.read != nil {
-		w.read.Close()
-		w.read = nil
+func (w *wayland) cancelRead(sel selection) {
+	s := &w.sel[sel]
+	if s.readCancel != nil {
+		s.readCancel()
+		s.readCancel = nil
 	}
 }
 
-func (w *wayland) publish(generation uint64, data []byte) error {
-	if w.pending != nil {
-		w.pending.Destroy()
+func (w *wayland) publish(sel selection, generation uint64, data clip) error {
+	s := &w.sel[sel]
+	if s.pending != nil {
+		s.pending.Destroy()
 	}
 	callback, err := w.display.Sync()
 	if err != nil {
 		return err
 	}
-	w.pending = callback
+	s.pending = callback
 	callback.SetDoneHandler(func(client.CallbackDoneEvent) {
 		callback.Destroy()
-		w.pending = nil
+		s.pending = nil
 		// Process earlier compositor events before replacing its selection.
-		if !w.b.state.current(generation) {
+		if !w.b.state[sel].current(generation) {
 			return
 		}
-		w.fail(w.setSelection(data))
+		w.fail(w.setSelection(sel, data))
 	})
 	return nil
 }
 
-func (w *wayland) setSelection(data []byte) error {
+func (w *wayland) setSelection(sel selection, data clip) error {
+	s := &w.sel[sel]
+	set := w.device.SetSelection
+	if sel == selPrimary {
+		set = w.device.SetPrimarySelection
+	}
+	if len(data) == 0 {
+		return w.unset(sel, set)
+	}
 	source, err := w.manager.CreateDataSource()
 	if err != nil {
 		return err
 	}
 	w.serial++
-	marker := fmt.Sprintf("application/x-clip-sync-%x-%d", w.nonce, w.serial)
-	for _, mime := range append(append([]string{}, textMIMEs...), marker) {
+	marker := fmt.Sprintf("%s%d", w.prefix, w.serial)
+	mimes := data.formats()
+	if _, ok := data[textKey]; ok {
+		mimes = append(slices.Clone(textMIMEs), mimes...)
+	}
+	for _, mime := range append(mimes, marker) {
 		if err := source.Offer(mime); err != nil {
 			source.Destroy()
 			return err
 		}
 	}
 	source.SetSendHandler(func(e control.ExtDataControlSourceV1SendEvent) {
-		payload := data
-		if e.MimeType == marker {
-			payload = nil
-		} else if mimeRank(e.MimeType) == len(textMIMEs) {
-			unix.Close(e.Fd)
-			return
+		var payload []byte // the marker type carries no data
+		if e.MimeType != marker {
+			key := e.MimeType
+			if slices.Contains(textMIMEs, key) {
+				key = textKey
+			}
+			value, ok := data[key]
+			if !ok {
+				unix.Close(e.Fd)
+				return
+			}
+			payload = value
 		}
 		w.serve(e.Fd, payload)
 	})
 	source.SetCancelledHandler(func(control.ExtDataControlSourceV1CancelledEvent) {
 		w.fail(source.Destroy())
-		if w.source == source {
-			w.source = nil
+		if s.source == source {
+			s.source = nil
 		}
 	})
-	if err := w.device.SetSelection(source); err != nil {
+	if err := set(source); err != nil {
 		source.Destroy()
 		return err
 	}
-	if w.source != nil {
-		if err := w.source.Destroy(); err != nil {
+	if s.source != nil {
+		if err := s.source.Destroy(); err != nil {
 			return err
 		}
 	}
-	w.source, w.marker = source, marker
-	w.b.state.copied(waylandSide, data)
+	s.source, s.marker = source, marker
+	w.b.state[sel].copied(waylandSide, data)
+	return nil
+}
+
+// unset clears a Wayland selection to mirror an empty X11 clipboard.
+func (w *wayland) unset(sel selection, set func(*control.ExtDataControlSourceV1) error) error {
+	s := &w.sel[sel]
+	if s.current != nil {
+		// The compositor reports the unset back as a selection event.
+		s.unsets++
+		if err := set(nil); err != nil {
+			return err
+		}
+	}
+	if s.source != nil {
+		if err := s.source.Destroy(); err != nil {
+			return err
+		}
+	}
+	s.source, s.marker = nil, ""
+	w.b.state[sel].copied(waylandSide, nil)
 	return nil
 }
 
@@ -399,7 +483,9 @@ func (w *wayland) dispatch(event wlEvent) (err error) {
 }
 
 func (w *wayland) close() {
-	w.cancelRead()
+	for sel := range w.sel {
+		w.cancelRead(selection(sel))
+	}
 	if w.done != nil {
 		w.display.Context().SetReadDeadline(time.Now())
 		<-w.done

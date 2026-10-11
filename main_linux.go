@@ -18,14 +18,15 @@ import (
 )
 
 type readResult struct {
+	sel        selection
 	generation uint64
-	data       []byte
+	data       clip
 	err        error
 }
 
 type bridge struct {
 	ctx     context.Context
-	state   syncState
+	state   [2]syncState
 	ready   bool
 	wl      *wayland
 	x       *x11
@@ -37,7 +38,7 @@ type bridge struct {
 func main() {
 	log.SetFlags(0)
 	flag.Usage = func() {
-		fmt.Fprintln(flag.CommandLine.Output(), "Usage: clip-sync\n\nBridge the current Wayland and X11 text clipboards.\nUses WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DISPLAY, and XAUTHORITY.")
+		fmt.Fprintln(flag.CommandLine.Output(), "Usage: clip-sync\n\nBridge the current Wayland and X11 clipboards.\nUses WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DISPLAY, and XAUTHORITY.")
 	}
 	flag.Parse()
 	if flag.NArg() != 0 {
@@ -122,38 +123,60 @@ func run(parent context.Context) error {
 				return fmt.Errorf("X11: %w", err)
 			}
 		case result := <-b.results:
-			if !b.state.current(result.generation) {
+			state := &b.state[result.sel]
+			if !state.current(result.generation) {
 				continue
 			}
 			if result.err != nil {
-				log.Print("clip-sync: ignored failed Wayland text transfer")
+				state.failed(result.generation)
+				log.Print("clip-sync: ignored failed Wayland transfer")
 				continue
 			}
-			if err := b.received(waylandSide, result.generation, result.data); err != nil {
+			if err := b.received(result.sel, waylandSide, result.generation, result.data); err != nil {
 				return err
 			}
 		case now := <-tick.C:
-			b.x.expire(now)
+			if err := b.x.expire(now); err != nil {
+				return fmt.Errorf("X11: %w", err)
+			}
 		}
 	}
 }
 
-func (b *bridge) changed(from side) uint64 {
-	if b.wl != nil {
-		b.wl.cancelRead()
-	}
-	b.x.cancelRead()
-	return b.state.changed(from)
+// active reports whether the bridge syncs sel. PRIMARY needs compositor support.
+func (b *bridge) active(sel selection) bool {
+	return sel == selClipboard || b.wl != nil && b.wl.primary
 }
 
-func (b *bridge) received(from side, generation uint64, data []byte) error {
-	if !b.state.received(from, generation, data) {
+func (b *bridge) changed(sel selection, from side) uint64 {
+	if b.wl != nil {
+		b.wl.cancelRead(sel)
+	}
+	b.x.cancelRead(sel)
+	return b.state[sel].changed(from)
+}
+
+func (b *bridge) received(sel selection, from side, generation uint64, data clip) error {
+	if !b.state[sel].received(from, generation, data) {
 		return nil
 	}
-	if from == waylandSide {
-		return b.x.publish(generation, data)
+	return b.publish(sel, 1-from, generation, data)
+}
+
+// emptied mirrors a clipboard that lost its owner on side from.
+func (b *bridge) emptied(sel selection, from side) error {
+	generation, mirror := b.state[sel].emptied(from)
+	if !mirror {
+		return nil
 	}
-	return b.wl.publish(generation, data)
+	return b.publish(sel, 1-from, generation, nil)
+}
+
+func (b *bridge) publish(sel selection, to side, generation uint64, data clip) error {
+	if to == x11Side {
+		return b.x.publish(sel, generation, data)
+	}
+	return b.wl.publish(sel, generation, data)
 }
 
 func lockSession() (*os.File, error) {

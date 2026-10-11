@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -69,33 +70,122 @@ func (d *desktop) copy(from side, data []byte, mime string) {
 	d.owners[from] = startTestProcess(d.t, cmd)
 }
 
-func (d *desktop) paste(from side) ([]byte, error) {
+func (d *desktop) await(from side, want []byte) {
+	d.t.Helper()
+	mime := "text"
+	if from == x11Side {
+		mime = "UTF8_STRING"
+	}
+	awaitFormat(d.t, from, selClipboard, mime, want)
+}
+
+func paste(from side, sel selection, mime string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	var cmd *exec.Cmd
 	if from == waylandSide {
-		cmd = exec.CommandContext(ctx, "wl-paste", "--no-newline", "--type", "text")
+		args := []string{"--no-newline", "--type", mime}
+		if sel == selPrimary {
+			args = append(args, "--primary")
+		}
+		cmd = exec.CommandContext(ctx, "wl-paste", args...)
 	} else {
-		cmd = exec.CommandContext(ctx, "xclip", "-selection", "clipboard", "-out", "-target", "UTF8_STRING")
+		cmd = exec.CommandContext(ctx, "xclip", "-selection", x11SelectionName(sel), "-out", "-target", mime)
 	}
 	// A Wayland source can retain the stdout descriptor after wl-paste exits.
 	cmd.WaitDelay = 100 * time.Millisecond
 	return cmd.Output()
 }
 
-func (d *desktop) await(from side, want []byte) {
-	d.t.Helper()
-	deadline := time.Now().Add(8 * time.Second)
+func awaitFormat(t *testing.T, from side, sel selection, mime string, want []byte) {
+	t.Helper()
+	// Outlast the bridge's transfer timeout, which can skip a stalled format first.
+	deadline := time.Now().Add(transferTimeout + 2*time.Second)
 	var got []byte
 	var err error
 	for time.Now().Before(deadline) {
-		got, err = d.paste(from)
+		got, err = paste(from, sel, mime)
 		if err == nil && bytes.Equal(got, want) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	d.t.Fatalf("clipboard %d mismatch: got %d bytes, want %d, error=%v", from, len(got), len(want), err)
+	t.Fatalf("side %d selection %d %s mismatch: got %d bytes, want %d, error=%v", from, sel, mime, len(got), len(want), err)
+}
+
+func awaitEmpty(t *testing.T, from side, sel selection) {
+	t.Helper()
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if clipboardEmpty(t, from, sel) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("side %d selection %d did not become empty", from, sel)
+}
+
+func clipboardEmpty(t *testing.T, from side, sel selection) bool {
+	t.Helper()
+	if from == x11Side {
+		return x11Owner(t, sel) == 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	args := []string{"--list-types"}
+	if sel == selPrimary {
+		args = append(args, "--primary")
+	}
+	cmd := exec.CommandContext(ctx, "wl-paste", args...)
+	cmd.WaitDelay = 100 * time.Millisecond
+	err := cmd.Run()
+	// A killed wl-paste also fails, so only a normal non-zero exit means empty.
+	var exit *exec.ExitError
+	return ctx.Err() == nil && errors.As(err, &exit) && exit.ExitCode() > 0
+}
+
+func x11SelectionName(sel selection) string {
+	if sel == selPrimary {
+		return "primary"
+	}
+	return "clipboard"
+}
+
+func x11Atom(t *testing.T, conn *xgb.Conn, name string) xproto.Atom {
+	t.Helper()
+	reply, err := xproto.InternAtom(conn, false, uint16(len(name)), name).Reply()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reply.Atom
+}
+
+func x11Owner(t *testing.T, sel selection) xproto.Window {
+	t.Helper()
+	conn, err := xgb.NewConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reply, err := xproto.GetSelectionOwner(conn, x11Atom(t, conn, strings.ToUpper(x11SelectionName(sel)))).Reply()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reply.Owner
+}
+
+// clearX11 unsets an X11 selection the way a client clears its clipboard.
+func clearX11(t *testing.T, sel selection) {
+	t.Helper()
+	conn, err := xgb.NewConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	atom := x11Atom(t, conn, strings.ToUpper(x11SelectionName(sel)))
+	if err := xproto.SetSelectionOwnerChecked(conn, 0, atom, xproto.TimeCurrentTime).Check(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestDesktopBridge(t *testing.T) {
@@ -212,14 +302,16 @@ func TestDesktopBridge(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	d.await(x11Side, fresh)
 
-	d.copy(waylandSide, []byte("not a text selection"), "image/png")
+	d.copy(waylandSide, []byte("unsupported content"), "application/x-unsupported")
 	time.Sleep(100 * time.Millisecond)
 	d.await(x11Side, fresh)
-	if err := exec.Command("wl-copy", "--clear").Run(); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(100 * time.Millisecond)
-	d.await(x11Side, fresh)
+
+	t.Run("formats", testFormats)
+	t.Run("oversized format", testOversizedFormat)
+	t.Run("stalled format", testStalledFormat)
+	t.Run("large image", testLargeImage)
+	t.Run("primary", testPrimary)
+	t.Run("clears", testClears)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	duplicate, err := exec.CommandContext(ctx, binary).CombinedOutput()
@@ -276,20 +368,128 @@ func TestDesktopBridge(t *testing.T) {
 	t.Logf("clipboard cycles completed; descriptors before=%d after=%d", before, after)
 }
 
-func delayedX11Copy(t *testing.T) (<-chan struct{}, func()) {
+func testFormats(t *testing.T) {
+	fromWayland := clip{
+		textKey:         []byte("rich text from Wayland"),
+		"text/html":     []byte("<b>rich</b> text from Wayland"),
+		"text/uri-list": []byte("file:///tmp/clip-sync-wayland\r\n"),
+		"image/png":     append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0, 1, 0xfe, 0xff}, 256)...),
+	}
+	ownWayland(t, selClipboard, []string{textKey, "text/html", "text/uri-list", "image/png"}, func(w *wayland, mime string, fd int) {
+		w.serve(fd, fromWayland[mime])
+	})
+	awaitFormat(t, x11Side, selClipboard, "UTF8_STRING", fromWayland[textKey])
+	for _, mime := range fromWayland.formats() {
+		awaitFormat(t, x11Side, selClipboard, mime, fromWayland[mime])
+	}
+
+	fromX11 := map[string][]byte{
+		"UTF8_STRING":                  []byte("rich text from X11"),
+		"text/html":                    []byte("<i>rich</i> text from X11"),
+		"x-special/gnome-copied-files": []byte("copy\nfile:///tmp/clip-sync-x11"),
+		"image/png":                    append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0xff, 0, 7}, 256)...),
+	}
+	ownX11(t, selClipboard, fromX11, nil)
+	awaitFormat(t, waylandSide, selClipboard, "text", fromX11["UTF8_STRING"])
+	for _, mime := range []string{"text/html", "x-special/gnome-copied-files", "image/png"} {
+		awaitFormat(t, waylandSide, selClipboard, mime, fromX11[mime])
+	}
+}
+
+func testOversizedFormat(t *testing.T) {
+	html := []byte("<p>valid after oversized text</p>")
+	ownWayland(t, selClipboard, []string{textKey, "text/html"}, func(_ *wayland, mime string, fd int) {
+		// Write in the event loop, one format at a time, like a blocking owner.
+		f := os.NewFile(uintptr(fd), "paste")
+		defer f.Close()
+		if mime == textKey {
+			f.Write(bytes.Repeat([]byte("x"), maxClipboardBytes+1<<20))
+			return
+		}
+		f.Write(html)
+	})
+	awaitFormat(t, x11Side, selClipboard, "text/html", html)
+}
+
+func testStalledFormat(t *testing.T) {
+	html := []byte("<p>sent although text stalls</p>")
+	ownX11(t, selClipboard, map[string][]byte{"UTF8_STRING": []byte("never sent"), "text/html": html}, func(target string) bool {
+		return target != "UTF8_STRING"
+	})
+	awaitFormat(t, waylandSide, selClipboard, "text/html", html)
+}
+
+func testLargeImage(t *testing.T) {
+	d := &desktop{t: t}
+	image := bytes.Repeat([]byte{0x89, 'P', 'N', 'G', 0, 0xff, '\r', '\n'}, 200000)
+	d.copy(waylandSide, image, "image/png")
+	awaitFormat(t, x11Side, selClipboard, "image/png", image)
+	image = bytes.Repeat([]byte{0, 'i', 'm', 'g', 0xff}, 300000)
+	d.copy(x11Side, image, "image/png")
+	awaitFormat(t, waylandSide, selClipboard, "image/png", image)
+}
+
+func testPrimary(t *testing.T) {
+	d := &desktop{t: t}
+	d.copy(waylandSide, []byte("clipboard stays"), textKey)
+	d.await(x11Side, []byte("clipboard stays"))
+
+	cmd := exec.Command("wl-copy", "--foreground", "--primary", "--type", textKey)
+	cmd.Stdin = strings.NewReader("primary from Wayland")
+	startTestProcess(t, cmd)
+	awaitFormat(t, x11Side, selPrimary, "UTF8_STRING", []byte("primary from Wayland"))
+
+	cmd = exec.Command("xclip", "-selection", "primary", "-in", "-quiet", "-target", "UTF8_STRING")
+	cmd.Stdin = strings.NewReader("primary from X11")
+	startTestProcess(t, cmd)
+	awaitFormat(t, waylandSide, selPrimary, "text", []byte("primary from X11"))
+	d.await(waylandSide, []byte("clipboard stays"))
+	d.await(x11Side, []byte("clipboard stays"))
+
+	if err := exec.Command("wl-copy", "--primary", "--clear").Run(); err != nil {
+		t.Fatal(err)
+	}
+	awaitEmpty(t, x11Side, selPrimary)
+	d.await(x11Side, []byte("clipboard stays"))
+}
+
+func testClears(t *testing.T) {
+	d := &desktop{t: t}
+	d.copy(waylandSide, []byte("cleared on Wayland"), textKey)
+	d.await(x11Side, []byte("cleared on Wayland"))
+	if err := exec.Command("wl-copy", "--clear").Run(); err != nil {
+		t.Fatal(err)
+	}
+	awaitEmpty(t, x11Side, selClipboard)
+
+	d.copy(x11Side, []byte("cleared on X11"), "UTF8_STRING")
+	d.await(waylandSide, []byte("cleared on X11"))
+	clearX11(t, selClipboard)
+	awaitEmpty(t, waylandSide, selClipboard)
+
+	d.copy(waylandSide, []byte("owner exits"), textKey)
+	d.await(x11Side, []byte("owner exits"))
+	d.owners[waylandSide].stop()
+	awaitEmpty(t, x11Side, selClipboard)
+}
+
+// ownX11 owns an X11 selection with the given targets until the test ends.
+// respond, if set, runs before each conversion other than TARGETS and can
+// leave the request unanswered.
+func ownX11(t *testing.T, sel selection, formats map[string][]byte, respond func(target string) bool) {
 	t.Helper()
 	conn, err := xgb.NewConn()
 	if err != nil {
 		t.Fatal(err)
 	}
-	atom := func(name string) xproto.Atom {
-		reply, err := xproto.InternAtom(conn, false, uint16(len(name)), name).Reply()
-		if err != nil {
-			t.Fatal(err)
-		}
-		return reply.Atom
+	selectionAtom, targets := x11Atom(t, conn, strings.ToUpper(x11SelectionName(sel))), x11Atom(t, conn, "TARGETS")
+	offered := []xproto.Atom{targets}
+	values, names := make(map[xproto.Atom][]byte), make(map[xproto.Atom]string)
+	for name, value := range formats {
+		atom := x11Atom(t, conn, name)
+		offered = append(offered, atom)
+		values[atom], names[atom] = value, name
 	}
-	clipboard, targets, text := atom("CLIPBOARD"), atom("TARGETS"), atom("UTF8_STRING")
 	window, err := xproto.NewWindowId(conn)
 	if err != nil {
 		t.Fatal(err)
@@ -298,10 +498,8 @@ func delayedX11Copy(t *testing.T) (<-chan struct{}, func()) {
 	if err := xproto.CreateWindowChecked(conn, 0, window, root, 0, 0, 1, 1, 0, xproto.WindowClassInputOnly, 0, 0, nil).Check(); err != nil {
 		t.Fatal(err)
 	}
-	requested, gate, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	release := sync.OnceFunc(func() { close(gate) })
-	once := sync.OnceFunc(func() { close(requested) })
-	t.Cleanup(func() { release(); conn.Close(); <-done })
+	done := make(chan struct{})
+	t.Cleanup(func() { conn.Close(); <-done })
 	go func() {
 		defer close(done)
 		for {
@@ -314,18 +512,18 @@ func delayedX11Copy(t *testing.T) (<-chan struct{}, func()) {
 				continue
 			}
 			notify := xproto.SelectionNotifyEvent{Time: e.Time, Requestor: e.Requestor, Selection: e.Selection, Target: e.Target}
-			var data []byte
-			kind, format := text, byte(8)
-			switch e.Target {
-			case targets:
-				kind, format, data = xproto.AtomAtom, 32, make([]byte, 4)
-				xgb.Put32(data, uint32(text))
-			case text:
-				once()
-				<-gate
-				data = []byte("stale X11 content")
-			default:
+			data, ok := values[e.Target]
+			kind, format := e.Target, byte(8)
+			switch {
+			case e.Target == targets:
+				kind, format, data = xproto.AtomAtom, 32, make([]byte, 4*len(offered))
+				for i, atom := range offered {
+					xgb.Put32(data[i*4:], uint32(atom))
+				}
+			case !ok:
 				xproto.SendEventChecked(conn, false, e.Requestor, 0, string(notify.Bytes())).Check()
+				continue
+			case respond != nil && !respond(names[e.Target]):
 				continue
 			}
 			if xproto.ChangePropertyChecked(conn, xproto.PropModeReplace, e.Requestor, e.Property, kind, format, uint32(len(data)/(int(format)/8)), data).Check() == nil {
@@ -334,13 +532,14 @@ func delayedX11Copy(t *testing.T) (<-chan struct{}, func()) {
 			xproto.SendEventChecked(conn, false, e.Requestor, 0, string(notify.Bytes())).Check()
 		}
 	}()
-	if err := xproto.SetSelectionOwnerChecked(conn, window, clipboard, xproto.TimeCurrentTime).Check(); err != nil {
+	if err := xproto.SetSelectionOwnerChecked(conn, window, selectionAtom, xproto.TimeCurrentTime).Check(); err != nil {
 		t.Fatal(err)
 	}
-	return requested, release
 }
 
-func delayedWaylandCopy(t *testing.T) (<-chan struct{}, func()) {
+// ownWayland offers mimes on a Wayland selection until the test ends.
+// send answers each paste request.
+func ownWayland(t *testing.T, sel selection, mimes []string, send func(w *wayland, mime string, fd int)) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &bridge{ctx: ctx, sends: make(chan struct{}, maxTransfers)}
@@ -349,12 +548,9 @@ func delayedWaylandCopy(t *testing.T) (<-chan struct{}, func()) {
 		cancel()
 		t.Fatal(err)
 	}
-	requested, gate, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	release := sync.OnceFunc(func() { close(gate) })
-	once := sync.OnceFunc(func() { close(requested) })
+	done := make(chan struct{})
 	started := false
 	t.Cleanup(func() {
-		release()
 		cancel()
 		if started {
 			<-done
@@ -366,16 +562,18 @@ func delayedWaylandCopy(t *testing.T) (<-chan struct{}, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := source.Offer("text/plain;charset=utf-8"); err != nil {
-		t.Fatal(err)
+	for _, mime := range mimes {
+		if err := source.Offer(mime); err != nil {
+			t.Fatal(err)
+		}
 	}
-	source.SetSendHandler(func(e control.ExtDataControlSourceV1SendEvent) {
-		once()
-		<-gate
-		w.serve(e.Fd, []byte("stale Wayland content"))
-	})
+	source.SetSendHandler(func(e control.ExtDataControlSourceV1SendEvent) { send(w, e.MimeType, e.Fd) })
 	source.SetCancelledHandler(func(control.ExtDataControlSourceV1CancelledEvent) { source.Destroy() })
-	if err := w.device.SetSelection(source); err != nil {
+	set := w.device.SetSelection
+	if sel == selPrimary {
+		set = w.device.SetPrimarySelection
+	}
+	if err := set(source); err != nil {
 		t.Fatal(err)
 	}
 	w.start()
@@ -393,5 +591,34 @@ func delayedWaylandCopy(t *testing.T) (<-chan struct{}, func()) {
 			}
 		}
 	}()
+}
+
+func delayedX11Copy(t *testing.T) (<-chan struct{}, func()) {
+	t.Helper()
+	requested, gate := make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	once := sync.OnceFunc(func() { close(requested) })
+	ownX11(t, selClipboard, map[string][]byte{"UTF8_STRING": []byte("stale X11 content")}, func(string) bool {
+		once()
+		<-gate
+		return true
+	})
+	// Release first: the owner's cleanup waits for a conversion blocked on the gate.
+	t.Cleanup(release)
+	return requested, release
+}
+
+func delayedWaylandCopy(t *testing.T) (<-chan struct{}, func()) {
+	t.Helper()
+	requested, gate := make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	once := sync.OnceFunc(func() { close(requested) })
+	ownWayland(t, selClipboard, []string{textKey}, func(w *wayland, _ string, fd int) {
+		once()
+		<-gate
+		w.serve(fd, []byte("stale Wayland content"))
+	})
+	// Release first: the owner's cleanup waits for a send handler blocked on the gate.
+	t.Cleanup(release)
 	return requested, release
 }

@@ -360,7 +360,7 @@ func (x *x11) finishTarget(sel selection) error {
 	if slices.Contains(x11TextTargets, name) {
 		if r.valueType == x.atoms["STRING"] {
 			data = fromLatin1(data)
-		} else if !x.textTarget(r.valueType) {
+		} else if !slices.Contains(textMIMEs, x.names[r.valueType]) {
 			return x.targetFailed(sel)
 		}
 		if len(data) > maxClipboardBytes || !utf8.Valid(data) {
@@ -418,18 +418,6 @@ func (x *x11) finishRead(sel selection) error {
 		return nil
 	}
 	return x.b.received(sel, x11Side, generation, data)
-}
-
-func (x *x11) textTarget(atom xproto.Atom) bool {
-	if atom == x.atoms["STRING"] {
-		return true
-	}
-	for _, mime := range textMIMEs {
-		if atom == x.atoms[mime] {
-			return true
-		}
-	}
-	return false
 }
 
 func (x *x11) readFailed(sel selection) {

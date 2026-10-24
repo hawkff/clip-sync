@@ -198,15 +198,18 @@ func (w *wayland) selection(sel selection, proxy *control.ExtDataControlOfferV1)
 	if !w.b.ready {
 		return
 	}
-	if s.current == nil {
-		if s.unsets > 0 {
-			s.unsets--
-			return
-		}
-		w.fail(w.b.emptied(sel, waylandSide))
+	if s.current == nil && s.unsets > 0 {
+		s.unsets--
 		return
 	}
-	if s.source != nil && s.current.own == s.marker {
+	if s.current != nil && s.marker != "" && s.current.own == s.marker {
+		// Our copy, or a clipboard manager's re-copy that kept our marker type.
+		return
+	}
+	// Any other change ends our copy, so restoring it later syncs as a new copy.
+	s.marker = ""
+	if s.current == nil {
+		w.fail(w.b.emptied(sel, waylandSide))
 		return
 	}
 	generation := w.b.changed(sel, waylandSide)

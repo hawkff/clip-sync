@@ -11,8 +11,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -312,6 +314,7 @@ func TestDesktopBridge(t *testing.T) {
 	t.Run("large image", testLargeImage)
 	t.Run("primary", testPrimary)
 	t.Run("clears", testClears)
+	t.Run("manager re-copy", testManagerRecopy)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	duplicate, err := exec.CommandContext(ctx, binary).CombinedOutput()
@@ -471,6 +474,54 @@ func testClears(t *testing.T) {
 	d.await(x11Side, []byte("owner exits"))
 	d.owners[waylandSide].stop()
 	awaitEmpty(t, x11Side, selClipboard)
+}
+
+// testManagerRecopy re-copies the bridge's Wayland copy with all of its types,
+// as wl-clip-persist does after every copy.
+func testManagerRecopy(t *testing.T) {
+	d := &desktop{t: t}
+	text := []byte("kept by a clipboard manager")
+	d.copy(x11Side, text, "UTF8_STRING")
+	d.await(waylandSide, text)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	list := exec.CommandContext(ctx, "wl-paste", "--list-types")
+	list.WaitDelay = 100 * time.Millisecond
+	output, err := list.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	types := strings.Fields(string(output))
+	var reads atomic.Int32
+	recopy := func() {
+		ownWayland(t, selClipboard, types, func(w *wayland, mime string, fd int) {
+			reads.Add(1)
+			value := text
+			if !slices.Contains(textMIMEs, mime) {
+				value = nil // the marker type carries no data
+			}
+			w.serve(fd, value)
+		})
+	}
+	recopy()
+	// The bridge handles Wayland events in order, so once a later PRIMARY
+	// copy reaches X11, the bridge has handled the re-copy.
+	primary := []byte("copied after the re-copy")
+	cmd := exec.Command("wl-copy", "--foreground", "--primary", "--type", textKey)
+	cmd.Stdin = bytes.NewReader(primary)
+	startTestProcess(t, cmd)
+	awaitFormat(t, x11Side, selPrimary, "UTF8_STRING", primary)
+	if n := reads.Load(); n != 0 {
+		t.Fatalf("bridge read its own copy back %d times", n)
+	}
+
+	// After a clear, a manager that restores the copy makes a new copy.
+	if err := exec.Command("wl-copy", "--clear").Run(); err != nil {
+		t.Fatal(err)
+	}
+	awaitEmpty(t, x11Side, selClipboard)
+	recopy()
+	awaitFormat(t, x11Side, selClipboard, "UTF8_STRING", text)
 }
 
 // ownX11 owns an X11 selection with the given targets until the test ends.

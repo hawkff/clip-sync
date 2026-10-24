@@ -85,7 +85,6 @@ func openWayland(b *bridge) (_ *wayland, err error) {
 	display.SetErrorHandler(func(e client.DisplayErrorEvent) {
 		w.fail(fmt.Errorf("compositor protocol error %d", e.Code))
 	})
-	display.SetDeleteIdHandler(func(e client.DisplayDeleteIdEvent) { ctx.DeleteID(e.Id) })
 	registry, err := display.GetRegistry()
 	if err != nil {
 		return nil, err

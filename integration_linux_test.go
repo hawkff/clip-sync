@@ -504,7 +504,13 @@ func testManagerRecopy(t *testing.T) {
 		})
 	}
 	recopy()
-	time.Sleep(300 * time.Millisecond)
+	// The bridge handles Wayland events in order, so once a later PRIMARY
+	// copy reaches X11, the bridge has handled the re-copy.
+	primary := []byte("copied after the re-copy")
+	cmd := exec.Command("wl-copy", "--foreground", "--primary", "--type", textKey)
+	cmd.Stdin = bytes.NewReader(primary)
+	startTestProcess(t, cmd)
+	awaitFormat(t, x11Side, selPrimary, "UTF8_STRING", primary)
 	if n := reads.Load(); n != 0 {
 		t.Fatalf("bridge read its own copy back %d times", n)
 	}

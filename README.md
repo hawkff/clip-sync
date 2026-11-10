@@ -61,6 +61,7 @@ clip-sync copies these formats when an app offers them, and leaves other formats
 - Rich text as `text/html` and `text/rtf`.
 - File lists as `text/uri-list`, plus the GNOME and KDE types that mark a copy or a cut.
 - One image, preferring `image/png`, then JPEG, GIF, WebP, and BMP.
+- The `x-kde-passwordManagerHint` type that password managers set on a secret.
 
 ## Behavior
 
@@ -74,7 +75,13 @@ clip-sync copies these formats when an app offers them, and leaves other formats
 - clip-sync ignores clipboard entries it created and skips content the other side already has.
   Copies don't loop, even when a clipboard manager re-copies them.
 - If you copy again while a slow transfer is running, clip-sync discards the older one.
-  Wayland and X11 share no clock, so if you copy on both sides at once, the copy clip-sync sees last wins.
+  Wayland and X11 share no clock, so if both sides change at once, clip-sync compares them.
+  When they differ, the copy it sees last wins.
+- Some compositors, such as sway, copy between Wayland and their own Xwayland while an X11 window has focus.
+  clip-sync then finds the same content on both sides and leaves both alone, so each app keeps its own copy.
+  A copy from X11 reaches Wayland 50 ms later, which gives the compositor time to place its copy first.
+  While no X11 window has focus, sway holds the X11 clipboard after a Wayland copy but refuses to hand out its content.
+  clip-sync then takes the X11 clipboard, so X11 programs such as the SPICE agent can still read the copy.
 
 ## Privacy
 
@@ -83,6 +90,7 @@ It doesn't keep a history or log clipboard contents.
 
 It syncs copied passwords like any other text.
 Any X11 client and any connected SPICE clipboard endpoint can read them.
+The `x-kde-passwordManagerHint` type crosses over with the password, so a clipboard manager that honors it skips the entry on both sides.
 When a password manager clears the clipboard after a timeout, clip-sync clears the other side too.
 A clipboard manager can put the password back, and its history keeps a separate copy that clip-sync doesn't clear.
 

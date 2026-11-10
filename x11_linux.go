@@ -1,9 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"io"
-	"log"
 	"slices"
 	"time"
 	"unicode/utf8"
@@ -55,13 +55,21 @@ type xPending struct {
 	data       clip
 }
 
+// xRetired is the requestor window of a read that ended.
+type xRetired struct {
+	window   xproto.Window
+	deadline time.Time
+}
+
 // xSelection tracks one X11 selection: CLIPBOARD or PRIMARY.
 type xSelection struct {
-	atom      xproto.Atom
-	owner     xproto.Window
+	atom  xproto.Atom
+	owner xproto.Window
+	// changedAt is the server time of the last owner change, for conversions.
+	changedAt xproto.Timestamp
 	owned     bool
 	data      clip
-	latin     []byte
+	// latinOK reports whether the text fits Latin-1, which STRING requires.
 	latinOK   bool
 	ownedTime xproto.Timestamp
 	read      *xRead
@@ -74,11 +82,13 @@ type xSelection struct {
 type x11 struct {
 	b         *bridge
 	conn      *xgb.Conn
+	root      xproto.Window
 	window    xproto.Window
 	atoms     map[string]xproto.Atom
 	names     map[xproto.Atom]string
 	sel       [2]xSelection
 	outgoing  map[xKey]*xSend
+	retired   []xRetired
 	chunkSize int
 	events    chan xEvent
 	done      chan struct{}
@@ -114,7 +124,8 @@ func openX11(b *bridge) (_ *x11, err error) {
 	if version.MajorVersion < 1 {
 		return nil, errors.New("XFixes selection notifications are unavailable")
 	}
-	x := &x11{b: b, conn: conn, atoms: make(map[string]xproto.Atom), names: make(map[xproto.Atom]string), outgoing: make(map[xKey]*xSend), events: make(chan xEvent, 32)}
+	setup := xproto.Setup(conn)
+	x := &x11{b: b, conn: conn, root: setup.DefaultScreen(conn).Root, atoms: make(map[string]xproto.Atom), names: make(map[xproto.Atom]string), outgoing: make(map[xKey]*xSend), events: make(chan xEvent, 32)}
 	names := []string{"CLIPBOARD", "PRIMARY", "TARGETS", "TEXT", "STRING", "TIMESTAMP", "INCR", "_CLIP_SYNC_DATA", "_CLIP_SYNC_TIME"}
 	for _, list := range [][]string{textMIMEs, extraMIMEs, imageMIMEs} {
 		names = append(names, list...)
@@ -144,7 +155,8 @@ func openX11(b *bridge) (_ *x11, err error) {
 		}
 		s.owner = owner.Owner
 	}
-	x.chunkSize = min(64<<10, int(xproto.Setup(conn).MaximumRequestLength)*4-24)
+	// The most data one ChangeProperty request can carry.
+	x.chunkSize = int(setup.MaximumRequestLength)*4 - 24
 	if x.chunkSize <= 0 {
 		return nil, errors.New("invalid X11 request size limit")
 	}
@@ -156,8 +168,7 @@ func (x *x11) newWindow() (xproto.Window, error) {
 	if err != nil {
 		return 0, err
 	}
-	root := xproto.Setup(x.conn).DefaultScreen(x.conn).Root
-	err = xproto.CreateWindowChecked(x.conn, 0, window, root, 0, 0, 1, 1, 0,
+	err = xproto.CreateWindowChecked(x.conn, 0, window, x.root, 0, 0, 1, 1, 0,
 		xproto.WindowClassInputOnly, 0, xproto.CwEventMask, []uint32{xproto.EventMaskPropertyChange}).Check()
 	return window, err
 }
@@ -182,6 +193,21 @@ func (x *x11) start() {
 			}
 		}
 	}()
+}
+
+// busy reports whether a read, an INCR send or a retired window can still time out.
+func (x *x11) busy() bool {
+	return x.sel[selClipboard].read != nil || x.sel[selPrimary].read != nil || len(x.outgoing) > 0 || len(x.retired) > 0
+}
+
+// retire keeps the requestor window of an ended read until the transfer
+// timeout has passed. Its owner may still answer the last request, and an
+// Xlib owner such as xclip exits when that write hits a destroyed window.
+// Data that arrives until then is dropped, which lets an INCR transfer run
+// to its end, so an owner that serves one transfer at a time can go on.
+func (x *x11) retire(window xproto.Window) {
+	x.retired = append(x.retired, xRetired{window, time.Now().Add(transferTimeout)})
+	xproto.DeletePropertyChecked(x.conn, window, x.atoms["_CLIP_SYNC_DATA"]).Check()
 }
 
 func (x *x11) selectionFor(atom xproto.Atom) (selection, bool) {
@@ -210,7 +236,7 @@ func (x *x11) handle(event xgb.Event) error {
 			return nil
 		}
 		s := &x.sel[sel]
-		s.owner = e.Owner
+		s.owner, s.changedAt = e.Owner, e.Timestamp
 		if !x.b.ready || !x.b.active(sel) || e.Owner == x.window {
 			return nil
 		}
@@ -218,20 +244,12 @@ func (x *x11) handle(event xgb.Event) error {
 			s.unsetting = false
 			return nil
 		}
-		s.owned, s.data, s.latin = false, nil, nil
+		s.owned, s.data = false, nil
 		x.cancelRead(sel)
 		if e.Owner == 0 {
 			return x.b.emptied(sel, x11Side)
 		}
-		generation := x.b.changed(sel, x11Side)
-		window, err := x.newWindow()
-		if err != nil {
-			return err
-		}
-		s.read = &xRead{window: window, owner: e.Owner, time: e.Timestamp, generation: generation, deadline: time.Now().Add(transferTimeout), clip: clip{}}
-		if x.convert(sel, x.atoms["TARGETS"]) != nil {
-			x.readFailed(sel)
-		}
+		return x.read(sel, x.b.changed(sel, x11Side), transferTimeout)
 	case xproto.SelectionNotifyEvent:
 		sel, ok := x.readFor(e.Requestor)
 		if !ok {
@@ -257,6 +275,11 @@ func (x *x11) handle(event xgb.Event) error {
 		if sel, ok := x.readFor(e.Window); ok && x.sel[sel].read.incremental && e.Atom == x.atoms["_CLIP_SYNC_DATA"] && e.State == xproto.PropertyNewValue {
 			return x.progress(sel)
 		}
+		if e.State == xproto.PropertyNewValue && e.Atom == x.atoms["_CLIP_SYNC_DATA"] && slices.ContainsFunc(x.retired, func(r xRetired) bool { return r.window == e.Window }) {
+			// Dropping the data asks the owner for the next INCR chunk.
+			xproto.DeletePropertyChecked(x.conn, e.Window, e.Atom).Check()
+			return nil
+		}
 		if e.State == xproto.PropertyDelete {
 			x.sendChunk(xKey{e.Window, e.Atom})
 		}
@@ -265,7 +288,7 @@ func (x *x11) handle(event xgb.Event) error {
 	case xproto.SelectionClearEvent:
 		if sel, ok := x.selectionFor(e.Selection); ok {
 			s := &x.sel[sel]
-			s.owned, s.data, s.latin = false, nil, nil
+			s.owned, s.data = false, nil
 		}
 	case xproto.DestroyNotifyEvent:
 		for key := range x.outgoing {
@@ -273,6 +296,23 @@ func (x *x11) handle(event xgb.Event) error {
 				x.finishSend(key)
 			}
 		}
+	}
+	return nil
+}
+
+// read starts reading the selection's current content for generation.
+func (x *x11) read(sel selection, generation uint64, timeout time.Duration) error {
+	s := &x.sel[sel]
+	if s.owner == 0 {
+		return x.b.failed(sel, x11Side, generation, false)
+	}
+	window, err := x.newWindow()
+	if err != nil {
+		return err
+	}
+	s.read = &xRead{window: window, owner: s.owner, time: s.changedAt, generation: generation, deadline: time.Now().Add(timeout), clip: clip{}}
+	if x.convert(sel, x.atoms["TARGETS"]) != nil {
+		return x.readFailed(sel)
 	}
 	return nil
 }
@@ -347,9 +387,9 @@ func (x *x11) finishTarget(sel selection) error {
 		r.targets = wanted(offered, x11TextTargets)
 		if len(r.targets) == 0 {
 			// Nothing to copy; the other clipboard keeps its content.
-			x.b.state[sel].failed(r.generation)
+			generation := r.generation
 			x.cancelRead(sel)
-			return nil
+			return x.b.failed(sel, x11Side, generation, false)
 		}
 		return x.nextTarget(sel)
 	}
@@ -389,14 +429,13 @@ func (x *x11) nextTarget(sel selection) error {
 func (x *x11) targetFailed(sel selection) error {
 	r := x.sel[sel].read
 	if r.target == x.atoms["TARGETS"] {
-		x.readFailed(sel)
-		return nil
+		return x.readFailed(sel)
 	}
 	window, err := x.newWindow()
 	if err != nil {
 		return err
 	}
-	xproto.DestroyWindowChecked(x.conn, r.window).Check()
+	x.retire(r.window)
 	r.window = window
 	return x.nextTarget(sel)
 }
@@ -405,8 +444,7 @@ func (x *x11) finishRead(sel selection) error {
 	s := &x.sel[sel]
 	r := s.read
 	if len(r.clip) == 0 {
-		x.readFailed(sel)
-		return nil
+		return x.readFailed(sel)
 	}
 	owner, err := xproto.GetSelectionOwner(x.conn, s.atom).Reply()
 	if err != nil {
@@ -420,20 +458,18 @@ func (x *x11) finishRead(sel selection) error {
 	return x.b.received(sel, x11Side, generation, data)
 }
 
-func (x *x11) readFailed(sel selection) {
-	log.Print("clip-sync: ignored failed X11 transfer")
-	if r := x.sel[sel].read; r != nil {
-		x.b.state[sel].failed(r.generation)
-	}
+func (x *x11) readFailed(sel selection) error {
+	generation := x.sel[sel].read.generation
+	// Free the read first: the next step may start another one.
 	x.cancelRead(sel)
+	return x.b.failed(sel, x11Side, generation, true)
 }
 
 func (x *x11) cancelRead(sel selection) {
 	s := &x.sel[sel]
 	if s.read != nil {
-		window := s.read.window
+		x.retire(s.read.window)
 		s.read = nil
-		xproto.DestroyWindowChecked(x.conn, window).Check()
 	}
 }
 
@@ -476,10 +512,7 @@ func (x *x11) claim(event xproto.PropertyNotifyEvent) error {
 			return nil
 		}
 		s.owned, s.owner, s.data, s.ownedTime = true, x.window, pending.data, event.Time
-		s.latin, s.latinOK = nil, false
-		if text, ok := pending.data[textKey]; ok {
-			s.latin, s.latinOK = toLatin1(text)
-		}
+		s.latinOK = bytes.IndexFunc(pending.data[textKey], func(r rune) bool { return r > 0xff }) < 0
 		x.b.state[sel].copied(x11Side, pending.data)
 		return nil
 	}
@@ -502,7 +535,7 @@ func (x *x11) unset(sel selection, time xproto.Timestamp) error {
 		}
 		s.unsetTime, s.unsetting = time, true
 	}
-	s.owned, s.data, s.latin, s.latinOK = false, nil, nil, false
+	s.owned, s.data, s.latinOK = false, nil, false
 	x.b.state[sel].copied(x11Side, nil)
 	return nil
 }
@@ -556,7 +589,8 @@ func (x *x11) send(e xproto.SelectionRequestEvent) {
 			if !s.latinOK {
 				return
 			}
-			data = s.latin
+			// Converted on demand: few requestors still ask for STRING.
+			data, _ = toLatin1(text)
 		default:
 			data = text
 		}
@@ -647,6 +681,15 @@ func (x *x11) expire(now time.Time) error {
 		if !now.Before(transfer.deadline) {
 			x.finishSend(key)
 		}
+	}
+	// Windows retire in order, and all wait the same time.
+	for len(x.retired) > 0 && !now.Before(x.retired[0].deadline) {
+		xproto.DestroyWindowChecked(x.conn, x.retired[0].window).Check()
+		x.retired = x.retired[1:]
+	}
+	if len(x.retired) == 0 {
+		// Let go of the array a burst of reads grew.
+		x.retired = nil
 	}
 	return nil
 }

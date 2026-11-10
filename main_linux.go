@@ -24,6 +24,12 @@ type readResult struct {
 	err        error
 }
 
+// held is an X11 copy waiting out settleDelay before it goes to Wayland.
+type held struct {
+	generation uint64
+	data       clip
+}
+
 type bridge struct {
 	ctx     context.Context
 	state   [2]syncState
@@ -33,6 +39,8 @@ type bridge struct {
 	results chan readResult
 	jobs    sync.WaitGroup
 	sends   chan struct{}
+	held    [2]held
+	settle  [2]*time.Timer
 }
 
 func main() {
@@ -67,6 +75,10 @@ func run(parent context.Context) error {
 
 	ctx, cancel := context.WithCancel(parent)
 	b := &bridge{ctx: ctx, results: make(chan readResult, maxTransfers), sends: make(chan struct{}, maxTransfers)}
+	for i := range b.settle {
+		b.settle[i] = time.NewTimer(settleDelay)
+		b.settle[i].Stop()
+	}
 	defer func() {
 		cancel()
 		if b.wl != nil {
@@ -105,9 +117,20 @@ func run(parent context.Context) error {
 	b.wl.start()
 	log.Print("clip-sync: ready")
 
-	tick := time.NewTicker(time.Second)
+	// The ticker runs only while an X11 transfer can time out.
+	const period = 100 * time.Millisecond
+	tick := time.NewTicker(period)
 	defer tick.Stop()
+	ticking := true
 	for {
+		if busy := b.x.busy(); busy != ticking {
+			ticking = busy
+			if busy {
+				tick.Reset(period)
+			} else {
+				tick.Stop()
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return nil
@@ -123,16 +146,21 @@ func run(parent context.Context) error {
 				return fmt.Errorf("X11: %w", err)
 			}
 		case result := <-b.results:
-			state := &b.state[result.sel]
-			if !state.current(result.generation) {
-				continue
-			}
+			var err error
 			if result.err != nil {
-				state.failed(result.generation)
-				log.Print("clip-sync: ignored failed Wayland transfer")
-				continue
+				err = b.failed(result.sel, waylandSide, result.generation, true)
+			} else {
+				err = b.received(result.sel, waylandSide, result.generation, result.data)
 			}
-			if err := b.received(result.sel, waylandSide, result.generation, result.data); err != nil {
+			if err != nil {
+				return err
+			}
+		case <-b.settle[selClipboard].C:
+			if err := b.release(selClipboard); err != nil {
+				return err
+			}
+		case <-b.settle[selPrimary].C:
+			if err := b.release(selPrimary); err != nil {
 				return err
 			}
 		case now := <-tick.C:
@@ -145,38 +173,80 @@ func run(parent context.Context) error {
 
 // active reports whether the bridge syncs sel. PRIMARY needs compositor support.
 func (b *bridge) active(sel selection) bool {
-	return sel == selClipboard || b.wl != nil && b.wl.primary
+	return sel == selClipboard || b.wl.primary
 }
 
 func (b *bridge) changed(sel selection, from side) uint64 {
-	if b.wl != nil {
-		b.wl.cancelRead(sel)
-	}
+	b.wl.cancelRead(sel)
 	b.x.cancelRead(sel)
 	return b.state[sel].changed(from)
 }
 
 func (b *bridge) received(sel selection, from side, generation uint64, data clip) error {
-	if !b.state[sel].received(from, generation, data) {
-		return nil
-	}
-	return b.publish(sel, 1-from, generation, data)
+	return b.next(sel, b.state[sel].received(from, generation, data))
 }
 
-// emptied mirrors a clipboard that lost its owner on side from.
-func (b *bridge) emptied(sel selection, from side) error {
-	generation, mirror := b.state[sel].emptied(from)
-	if !mirror {
-		return nil
+// failed handles a read of side from that produced nothing to copy. transfer
+// tells a failed transfer from a selection without a format the bridge copies.
+func (b *bridge) failed(sel selection, from side, generation uint64, transfer bool) error {
+	state := &b.state[sel]
+	current := state.current(generation)
+	st := state.failed(from, generation)
+	// A failed read that the other side's copy then replaces is not worth a log line.
+	if transfer && current && st.kind == stepNone {
+		log.Printf("clip-sync: ignored failed %s transfer", from)
 	}
-	return b.publish(sel, 1-from, generation, nil)
+	return b.next(sel, st)
+}
+
+// emptied handles a clipboard that lost its owner on side from.
+func (b *bridge) emptied(sel selection, from side) error {
+	return b.next(sel, b.state[sel].emptied(from))
+}
+
+func (b *bridge) next(sel selection, st step) error {
+	generation := b.state[sel].generation
+	switch st.kind {
+	case stepPublish:
+		return b.publish(sel, st.to, generation, st.data)
+	case stepVerify:
+		return b.read(sel, st.to, generation, verifyTimeout)
+	case stepReread:
+		return b.read(sel, st.to, b.changed(sel, st.to), transferTimeout)
+	}
+	return nil
+}
+
+// read starts reading the current content of side from for generation.
+func (b *bridge) read(sel selection, from side, generation uint64, timeout time.Duration) error {
+	if from == x11Side {
+		return b.x.read(sel, generation, timeout)
+	}
+	return b.wl.read(sel, generation, timeout)
 }
 
 func (b *bridge) publish(sel selection, to side, generation uint64, data clip) error {
-	if to == x11Side {
+	switch {
+	case to == x11Side:
 		return b.x.publish(sel, generation, data)
+	case len(data) == 0:
+		return b.wl.publish(sel, generation, data)
 	}
-	return b.wl.publish(sel, generation, data)
+	// A compositor that bridges X11 itself is copying the same selection to
+	// Wayland right now. Let its copy show up first, so the two do not race.
+	b.held[sel] = held{generation, data}
+	b.settle[sel].Reset(settleDelay)
+	return nil
+}
+
+// release publishes the copy held for sel, unless a later change replaced it.
+func (b *bridge) release(sel selection) error {
+	h := b.held[sel]
+	b.held[sel] = held{}
+	if h.data == nil || !b.state[sel].current(h.generation) {
+		return nil
+	}
+	return b.wl.publish(sel, h.generation, h.data)
 }
 
 func lockSession() (*os.File, error) {

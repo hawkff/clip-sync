@@ -30,10 +30,19 @@ trap 'exit 143' TERM
 export XDG_RUNTIME_DIR="$runtime"
 export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1
 unset WAYLAND_DISPLAY
-printf 'xwayland disable\n' > "$runtime/sway.conf"
 
-Xvfb -displayfd 3 -nolisten tcp -screen 0 1024x768x24 3>"$runtime/display" >"$runtime/xvfb.log" 2>&1 &
-xvfb_pid=$!
+if [ -n "${CLIP_SYNC_XWAYLAND:-}" ]; then
+    # Use the compositor's own Xwayland, which copies between the clipboards
+    # itself while an X11 window has focus.
+    cat > "$runtime/sway.conf" <<'EOF'
+xwayland enable
+exec echo "$DISPLAY" > "$XDG_RUNTIME_DIR/display"
+EOF
+else
+    printf 'xwayland disable\n' > "$runtime/sway.conf"
+    Xvfb -displayfd 3 -nolisten tcp -screen 0 1024x768x24 3>"$runtime/display" >"$runtime/xvfb.log" 2>&1 &
+    xvfb_pid=$!
+fi
 sway -c "$runtime/sway.conf" >"$runtime/sway.log" 2>&1 &
 sway_pid=$!
 
@@ -48,9 +57,9 @@ while [ "$attempt" -lt 100 ]; do
     if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -s "$runtime/display" ]; then
         break
     fi
-    if ! kill -0 "$sway_pid" 2>/dev/null || ! kill -0 "$xvfb_pid" 2>/dev/null; then
+    if ! kill -0 "$sway_pid" 2>/dev/null || { [ -n "$xvfb_pid" ] && ! kill -0 "$xvfb_pid" 2>/dev/null; }; then
         echo "Headless desktop startup failed." >&2
-        tail -n 30 "$runtime/sway.log" "$runtime/xvfb.log" >&2
+        tail -n 30 "$runtime"/*.log >&2
         exit 1
     fi
     attempt=$((attempt + 1))
@@ -62,5 +71,12 @@ if [ -z "${WAYLAND_DISPLAY:-}" ] || [ ! -s "$runtime/display" ]; then
     exit 1
 fi
 read -r display < "$runtime/display"
-export DISPLAY=":$display"
+# Xvfb writes the display number, and the compositor writes it with a colon.
+export DISPLAY=":${display#:}"
+# swaymsg needs the socket to give an X11 window focus.
+for socket in "$runtime"/sway-ipc.*.sock; do
+    if [ -S "$socket" ]; then
+        export SWAYSOCK="$socket"
+    fi
+done
 "$@"

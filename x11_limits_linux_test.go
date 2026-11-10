@@ -36,7 +36,7 @@ func testX11Limits(t *testing.T, logs string) {
 			if test.target == "STRING" {
 				want = bytes.Repeat([]byte("é"), test.size)
 			}
-			stopValid := serveX11LimitSelection(t, valid, test.target, test.incremental, test.advertiseSize)
+			stopValid := serveX11LimitSelection(t, valid, test.target, test.incremental, test.advertiseSize, nil)
 			d.await(waylandSide, want)
 
 			failures := func() int {
@@ -48,7 +48,7 @@ func testX11Limits(t *testing.T, logs string) {
 			}
 			before := failures()
 			oversized := bytes.Repeat([]byte{test.fill}, test.size+1)
-			stop := serveX11LimitSelection(t, oversized, test.target, test.incremental, test.advertiseSize)
+			stop := serveX11LimitSelection(t, oversized, test.target, test.incremental, test.advertiseSize, nil)
 			// The oversized owner replaced this one, so closing it does not empty the clipboard.
 			stopValid()
 			// Require rejection before the ten-second transfer timeout can mask a stalled fixture.
@@ -67,9 +67,21 @@ func testX11Limits(t *testing.T, logs string) {
 			d.await(waylandSide, recovery)
 		})
 	}
+	t.Run("X11 limit/format after rejected INCR", func(t *testing.T) {
+		// The owner sends the HTML only after the bridge has taken every
+		// chunk of the text it rejected.
+		html := []byte("<p>sent after oversized text</p>")
+		oversized := bytes.Repeat([]byte("x"), maxClipboardBytes+1)
+		stop := serveX11LimitSelection(t, oversized, "UTF8_STRING", true, true, html)
+		awaitFormat(t, waylandSide, selClipboard, "text/html", html)
+		stop()
+	})
 }
 
-func serveX11LimitSelection(t *testing.T, data []byte, targetName string, incremental, advertiseSize bool) func() {
+// serveX11LimitSelection owns the X11 clipboard with data as targetName. With
+// html it also offers text/html, and like an owner that serves one transfer
+// at a time, it answers that request only once no INCR transfer is running.
+func serveX11LimitSelection(t *testing.T, data []byte, targetName string, incremental, advertiseSize bool, html []byte) func() {
 	t.Helper()
 	conn, err := xgb.NewConn()
 	if err != nil {
@@ -86,6 +98,7 @@ func serveX11LimitSelection(t *testing.T, data []byte, targetName string, increm
 	})
 	t.Cleanup(stop)
 	clipboard, targets, text, incr := x11Atom(t, conn, "CLIPBOARD"), x11Atom(t, conn, "TARGETS"), x11Atom(t, conn, targetName), x11Atom(t, conn, "INCR")
+	htmlAtom := x11Atom(t, conn, "text/html")
 	window, err := xproto.NewWindowId(conn)
 	if err != nil {
 		t.Fatal(err)
@@ -105,12 +118,17 @@ func serveX11LimitSelection(t *testing.T, data []byte, targetName string, increm
 		select {
 		case <-closing:
 		default:
-			// Rejection destroys the requestor while an INCR chunk may still be in flight.
-			if _, gone := err.(xproto.WindowError); !gone {
-				t.Errorf("X11 selection fixture: %v", err)
-			}
+			// The bridge keeps a requestor window while its owner may still write to it.
+			t.Errorf("X11 selection fixture: %v", err)
 		}
 		return true
+	}
+	sendHTML := func(e xproto.SelectionRequestEvent) {
+		notify := xproto.SelectionNotifyEvent{Time: e.Time, Requestor: e.Requestor, Selection: e.Selection, Target: e.Target}
+		if !failed(xproto.ChangePropertyChecked(conn, xproto.PropModeReplace, e.Requestor, e.Property, htmlAtom, 8, uint32(len(html)), html).Check()) {
+			notify.Property = e.Property
+		}
+		failed(xproto.SendEventChecked(conn, false, e.Requestor, 0, string(notify.Bytes())).Check())
 	}
 	done = make(chan struct{})
 	go func() {
@@ -118,6 +136,7 @@ func serveX11LimitSelection(t *testing.T, data []byte, targetName string, increm
 		var requestor xproto.Window
 		var property xproto.Atom
 		var remaining []byte
+		var waiting *xproto.SelectionRequestEvent
 		for {
 			event, err := conn.WaitForEvent()
 			if err != nil {
@@ -137,11 +156,24 @@ func serveX11LimitSelection(t *testing.T, data []byte, targetName string, increm
 			prepareReply:
 				switch e.Target {
 				case targets:
-					value := make([]byte, 4)
-					xgb.Put32(value, uint32(text))
-					if !failed(xproto.ChangePropertyChecked(conn, xproto.PropModeReplace, e.Requestor, prop, xproto.AtomAtom, 32, 1, value).Check()) {
+					offered := []xproto.Atom{text}
+					if html != nil {
+						offered = append(offered, htmlAtom)
+					}
+					value := make([]byte, 4*len(offered))
+					for i, atom := range offered {
+						xgb.Put32(value[i*4:], uint32(atom))
+					}
+					if !failed(xproto.ChangePropertyChecked(conn, xproto.PropModeReplace, e.Requestor, prop, xproto.AtomAtom, 32, uint32(len(offered)), value).Check()) {
 						notify.Property = prop
 					}
+				case htmlAtom:
+					if requestor != 0 {
+						waiting = &e
+					} else {
+						sendHTML(e)
+					}
+					continue
 				case text:
 					if incremental {
 						if failed(xproto.ChangeWindowAttributesChecked(conn, e.Requestor, xproto.CwEventMask, []uint32{xproto.EventMaskPropertyChange}).Check()) {
@@ -178,6 +210,10 @@ func serveX11LimitSelection(t *testing.T, data []byte, targetName string, increm
 				n := min(len(remaining), chunkSize)
 				if failed(xproto.ChangePropertyChecked(conn, xproto.PropModeReplace, requestor, property, text, 8, uint32(n), remaining[:n]).Check()) || n == 0 {
 					requestor, remaining = 0, nil
+					if waiting != nil {
+						sendHTML(*waiting)
+						waiting = nil
+					}
 					continue
 				}
 				remaining = remaining[n:]

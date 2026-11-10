@@ -211,19 +211,27 @@ func (w *wayland) selection(sel selection, proxy *control.ExtDataControlOfferV1)
 		w.fail(w.b.emptied(sel, waylandSide))
 		return
 	}
-	generation := w.b.changed(sel, waylandSide)
-	mimes := wanted(s.current.offered, textMIMEs)
-	if len(mimes) == 0 {
-		// Nothing to copy; the other clipboard keeps its content.
-		w.b.state[sel].failed(generation)
-		return
-	}
-	w.read(sel, generation, s.current.proxy, mimes)
+	w.fail(w.read(sel, w.b.changed(sel, waylandSide), transferTimeout))
 }
 
-// read receives every wanted format at once, so an owner that writes them in
-// any order cannot stall the transfer.
-func (w *wayland) read(sel selection, generation uint64, proxy *control.ExtDataControlOfferV1, mimes []string) {
+// read starts reading the current selection for generation.
+func (w *wayland) read(sel selection, generation uint64, timeout time.Duration) error {
+	s := &w.sel[sel]
+	var mimes []string
+	if s.current != nil {
+		mimes = wanted(s.current.offered, textMIMEs)
+	}
+	if len(mimes) == 0 {
+		// Nothing to copy; the other clipboard keeps its content.
+		return w.b.failed(sel, waylandSide, generation, false)
+	}
+	w.receive(sel, generation, s.current.proxy, mimes, timeout)
+	return nil
+}
+
+// receive requests every wanted format at once, so an owner that writes them
+// in any order cannot stall the transfer.
+func (w *wayland) receive(sel selection, generation uint64, proxy *control.ExtDataControlOfferV1, mimes []string, timeout time.Duration) {
 	pipes := make([]*os.File, 0, len(mimes))
 	closePipes := func() {
 		for _, r := range pipes {
@@ -238,7 +246,7 @@ func (w *wayland) read(sel selection, generation uint64, proxy *control.ExtDataC
 			return
 		}
 		pipes = append(pipes, r)
-		if err = r.SetReadDeadline(time.Now().Add(transferTimeout)); err == nil {
+		if err = r.SetReadDeadline(time.Now().Add(timeout)); err == nil {
 			err = proxy.Receive(mime, int(writer.Fd()))
 		}
 		writer.Close()

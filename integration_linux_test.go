@@ -190,7 +190,10 @@ func clearX11(t *testing.T, sel selection) {
 	}
 }
 
-func TestDesktopBridge(t *testing.T) {
+// startBridge runs the bridge and waits until it is ready. It returns the
+// path of the binary, the process, and the path of its log.
+func startBridge(t *testing.T) (string, *testProcess, string) {
+	t.Helper()
 	binary := os.Getenv("CLIP_SYNC_BINARY")
 	if binary == "" {
 		t.Fatal("set CLIP_SYNC_BINARY and run through scripts/integration.sh")
@@ -200,18 +203,13 @@ func TestDesktopBridge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer logFile.Close()
 	t.Cleanup(func() {
+		logFile.Close()
 		if t.Failed() {
 			output, _ := os.ReadFile(logs)
 			t.Logf("bridge log:\n%s", output)
 		}
 	})
-	d := &desktop{t: t}
-	d.copy(waylandSide, []byte("initial Wayland"), "text/plain;charset=utf-8")
-	d.await(waylandSide, []byte("initial Wayland"))
-	d.copy(x11Side, []byte("initial X11"), "UTF8_STRING")
-	d.await(x11Side, []byte("initial X11"))
 	cmd := exec.Command(binary)
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	process := startTestProcess(t, cmd)
@@ -219,7 +217,7 @@ func TestDesktopBridge(t *testing.T) {
 	for {
 		output, _ := os.ReadFile(logs)
 		if strings.Contains(string(output), "clip-sync: ready") {
-			break
+			return binary, process, logs
 		}
 		select {
 		case <-process.done:
@@ -231,6 +229,15 @@ func TestDesktopBridge(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+func TestDesktopBridge(t *testing.T) {
+	d := &desktop{t: t}
+	d.copy(waylandSide, []byte("initial Wayland"), "text/plain;charset=utf-8")
+	d.await(waylandSide, []byte("initial Wayland"))
+	d.copy(x11Side, []byte("initial X11"), "UTF8_STRING")
+	d.await(x11Side, []byte("initial X11"))
+	binary, process, logs := startBridge(t)
 	d.await(waylandSide, []byte("initial Wayland"))
 	d.await(x11Side, []byte("initial X11"))
 	for _, data := range [][]byte{
@@ -371,17 +378,103 @@ func TestDesktopBridge(t *testing.T) {
 	t.Logf("clipboard cycles completed; descriptors before=%d after=%d", before, after)
 }
 
+// TestCompositorBridge runs the bridge next to a compositor that copies
+// between Wayland and its own Xwayland while an X11 window has focus. Every
+// copy must arrive, and the bridge must not take a selection from its owner.
+func TestCompositorBridge(t *testing.T) {
+	if os.Getenv("CLIP_SYNC_XWAYLAND") == "" {
+		t.Skip("set CLIP_SYNC_XWAYLAND and run through scripts/integration.sh")
+	}
+	startBridge(t)
+	d := &desktop{t: t}
+	// exchange copies in both directions. The copy tools on the sides in
+	// keeps must still own their selection after the copy crossed.
+	exchange := func(name string, keeps ...side) {
+		for i := range 8 {
+			for _, from := range []side{x11Side, waylandSide} {
+				mime := "text/plain;charset=utf-8"
+				if from == x11Side {
+					mime = "UTF8_STRING"
+				}
+				data := fmt.Appendf(nil, "%s copy %d from %s", name, i, from)
+				d.copy(from, data, mime)
+				d.await(1-from, data)
+				if !slices.Contains(keeps, from) {
+					continue
+				}
+				// Both copy tools exit once they lose their selection.
+				select {
+				case <-d.owners[from].done:
+					t.Fatalf("%s: the %s owner lost its selection", name, from)
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+		}
+	}
+	// The compositor does not bridge until an X11 window gets focus.
+	exchange("before focus", x11Side, waylandSide)
+	closeWindow := focusX11Window(t)
+	exchange("focused", x11Side, waylandSide)
+	// Without a focused X11 window the compositor still owns the X11
+	// selection after each Wayland copy, but refuses to serve it. It also
+	// takes the X11 selection from its owner when the copy reaches Wayland.
+	closeWindow()
+	exchange("after focus", waylandSide)
+}
+
+// focusX11Window maps an X11 window and gives it focus, which makes the
+// compositor bridge the clipboards itself. The returned function closes it.
+func focusX11Window(t *testing.T) func() {
+	t.Helper()
+	conn, err := xgb.NewConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(conn.Close)
+	window, err := xproto.NewWindowId(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	screen := xproto.Setup(conn).DefaultScreen(conn)
+	if err := xproto.CreateWindowChecked(conn, screen.RootDepth, window, screen.Root, 0, 0, 100, 100, 0,
+		xproto.WindowClassInputOutput, screen.RootVisual, xproto.CwBackPixel, []uint32{screen.WhitePixel}).Check(); err != nil {
+		t.Fatal(err)
+	}
+	// swaymsg fails until the compositor shows the window. The compositor can
+	// miss a window's first frame and then never shows it, so map the window
+	// again every half second.
+	deadline := time.Now().Add(10 * time.Second)
+	for attempt := 0; ; attempt++ {
+		if attempt%10 == 0 {
+			xproto.UnmapWindowChecked(conn, window).Check()
+			if err := xproto.MapWindowChecked(conn, window).Check(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if exec.Command("swaymsg", `[shell="xwayland"] focus`).Run() == nil {
+			return conn.Close
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the X11 window did not get focus")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func testFormats(t *testing.T) {
 	fromWayland := clip{
-		textKey:         []byte("rich text from Wayland"),
-		"text/html":     []byte("<b>rich</b> text from Wayland"),
-		"text/uri-list": []byte("file:///tmp/clip-sync-wayland\r\n"),
-		"image/png":     append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0, 1, 0xfe, 0xff}, 256)...),
+		textKey:                     []byte("rich text from Wayland"),
+		"text/html":                 []byte("<b>rich</b> text from Wayland"),
+		"text/uri-list":             []byte("file:///tmp/clip-sync-wayland\r\n"),
+		"x-kde-passwordManagerHint": []byte("secret"),
+		"image/png":                 append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0, 1, 0xfe, 0xff}, 256)...),
 	}
-	ownWayland(t, selClipboard, []string{textKey, "text/html", "text/uri-list", "image/png"}, func(w *wayland, mime string, fd int) {
+	ownWayland(t, selClipboard, []string{textKey, "text/html", "text/uri-list", "x-kde-passwordManagerHint", "image/png"}, func(w *wayland, mime string, fd int) {
 		w.serve(fd, fromWayland[mime])
 	})
 	awaitFormat(t, x11Side, selClipboard, "UTF8_STRING", fromWayland[textKey])
+	// This text fits Latin-1, so legacy X11 apps can ask for STRING.
+	awaitFormat(t, x11Side, selClipboard, "STRING", fromWayland[textKey])
 	for _, mime := range fromWayland.formats() {
 		awaitFormat(t, x11Side, selClipboard, mime, fromWayland[mime])
 	}
@@ -390,11 +483,12 @@ func testFormats(t *testing.T) {
 		"UTF8_STRING":                  []byte("rich text from X11"),
 		"text/html":                    []byte("<i>rich</i> text from X11"),
 		"x-special/gnome-copied-files": []byte("copy\nfile:///tmp/clip-sync-x11"),
+		"x-kde-passwordManagerHint":    []byte("secret"),
 		"image/png":                    append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0xff, 0, 7}, 256)...),
 	}
 	ownX11(t, selClipboard, fromX11, nil)
 	awaitFormat(t, waylandSide, selClipboard, "text", fromX11["UTF8_STRING"])
-	for _, mime := range []string{"text/html", "x-special/gnome-copied-files", "image/png"} {
+	for _, mime := range []string{"text/html", "x-special/gnome-copied-files", "x-kde-passwordManagerHint", "image/png"} {
 		awaitFormat(t, waylandSide, selClipboard, mime, fromX11[mime])
 	}
 }
@@ -551,8 +645,12 @@ func ownX11(t *testing.T, sel selection, formats map[string][]byte, respond func
 	}
 	done := make(chan struct{})
 	t.Cleanup(func() { conn.Close(); <-done })
+	// A window ID without these bits names the client that created it.
+	client := ^xproto.Window(xproto.Setup(conn).ResourceIdMask)
 	go func() {
 		defer close(done)
+		// The bridge asks first, when it sees the new owner.
+		var bridge xproto.Window
 		for {
 			event, err := conn.WaitForEvent()
 			if event == nil || err != nil {
@@ -561,6 +659,9 @@ func ownX11(t *testing.T, sel selection, formats map[string][]byte, respond func
 			e, ok := event.(xproto.SelectionRequestEvent)
 			if !ok {
 				continue
+			}
+			if bridge == 0 {
+				bridge = e.Requestor & client
 			}
 			notify := xproto.SelectionNotifyEvent{Time: e.Time, Requestor: e.Requestor, Selection: e.Selection, Target: e.Target}
 			data, ok := values[e.Target]
@@ -577,7 +678,12 @@ func ownX11(t *testing.T, sel selection, formats map[string][]byte, respond func
 			case respond != nil && !respond(names[e.Target]):
 				continue
 			}
-			if xproto.ChangePropertyChecked(conn, xproto.PropModeReplace, e.Requestor, e.Property, kind, format, uint32(len(data)/(int(format)/8)), data).Check() == nil {
+			writeErr := xproto.ChangePropertyChecked(conn, xproto.PropModeReplace, e.Requestor, e.Property, kind, format, uint32(len(data)/(int(format)/8)), data).Check()
+			if _, gone := writeErr.(xproto.WindowError); gone && e.Requestor&client == bridge {
+				// An Xlib owner such as xclip exits on this error, and its copy goes with it.
+				t.Errorf("the bridge destroyed a requestor window before its owner answered")
+			}
+			if writeErr == nil {
 				notify.Property = e.Property
 			}
 			xproto.SendEventChecked(conn, false, e.Requestor, 0, string(notify.Bytes())).Check()
